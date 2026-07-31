@@ -38,23 +38,23 @@
 (deftest parse-basic-match-where-return
   (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name, n.role")]
     (is (= [{:var "n" :label "users"}] (:nodes (:pattern ast))))
-    (is (= [{:var "n" :prop "role" :value "admin"}] (:where ast)))
+    (is (= [{:kind :cmp :var "n" :prop "role" :value "admin"}] (cypher/where-leaves (:where ast))))
     (is (= [{:var "n" :prop "name"} {:var "n" :prop "role"}] (:return ast)))))
 
 (deftest parse-return-only-no-where
   (let [ast (cypher/parse "MATCH (n:users) RETURN n.name")]
-    (is (= [] (:where ast)))
+    (is (= [] (cypher/where-leaves (:where ast))))
     (is (= [{:var "n" :prop "name"}] (:return ast)))))
 
 (deftest parse-multiple-and-predicates
   (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' AND n.name = 'Alice' RETURN n.name")]
-    (is (= 2 (count (:where ast))))))
+    (is (= 2 (count (cypher/where-leaves (:where ast)))))))
 
 (deftest parse-numeric-boolean-null-and-negative-values
-  (is (= 900000 (:value (first (:where (cypher/parse "MATCH (d:departments) WHERE d.budget = 900000 RETURN d.name"))))))
-  (is (= true (:value (first (:where (cypher/parse "MATCH (n:users) WHERE n.active = true RETURN n.name"))))))
-  (is (= nil (:value (first (:where (cypher/parse "MATCH (n:users) WHERE n.deleted = null RETURN n.name"))))))
-  (is (= -5 (:value (first (:where (cypher/parse "MATCH (n:users) WHERE n.score = -5 RETURN n.name")))))))
+  (is (= 900000 (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (d:departments) WHERE d.budget = 900000 RETURN d.name")))))))
+  (is (= true (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:users) WHERE n.active = true RETURN n.name")))))))
+  (is (= nil (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:users) WHERE n.deleted = null RETURN n.name")))))))
+  (is (= -5 (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:users) WHERE n.score = -5 RETURN n.name"))))))))
 
 (deftest parse-relationship-pattern
   (let [ast (cypher/parse "MATCH (u:users)-[:WORKS_AT]->(d:departments) RETURN u.name, d.name")]
@@ -63,7 +63,7 @@
 
 (deftest parse-parameter-value
   (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = $role RETURN n.name")]
-    (is (= {:cypher/param "role"} (:value (first (:where ast)))))))
+    (is (= {:cypher/param "role"} (:value (first (cypher/where-leaves (:where ast))))))))
 
 ;; ----------------------------------------------------- parse rejections
 
@@ -322,8 +322,8 @@
 (deftest comparisons-parse-into-an-op
   (doseq [[text op] [["=" nil] ["<" '<] [">" '>] ["<=" '<=] [">=" '>=] ["<>" 'not=]]]
     (let [ast (cypher/parse (str "MATCH (n:people) WHERE n.age " text " 18 RETURN n.name"))]
-      (is (= op (:op (first (:where ast)))) text)
-      (is (= 18 (:value (first (:where ast))))))))
+      (is (= op (:op (first (cypher/where-leaves (:where ast))))) text)
+      (is (= 18 (:value (first (cypher/where-leaves (:where ast)))))))))
 
 (deftest equality-stays-a-triple-and-comparison-becomes-a-predicate
   (testing "same operator family, two very different plans: `=` puts the
@@ -372,5 +372,60 @@
 
 (deftest two-char-operators-are-not-scanned-as-two-tokens
   (testing "<= must not scan as < then =, and <> must not scan as < then >"
-    (is (= '<= (:op (first (:where (cypher/parse "MATCH (n:people) WHERE n.age <= 1 RETURN n.name"))))))
-    (is (= 'not= (:op (first (:where (cypher/parse "MATCH (n:people) WHERE n.age <> 1 RETURN n.name"))))))))
+    (is (= '<= (:op (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:people) WHERE n.age <= 1 RETURN n.name")))))))
+    (is (= 'not= (:op (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:people) WHERE n.age <> 1 RETURN n.name")))))))))
+
+;; --- OR / NOT in WHERE -----------------------------------------------------
+
+(deftest or-and-not-run-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"]]
+           (run "MATCH (n:users) WHERE n.role = 'admin' OR n.works_at = 'd2' RETURN n.name")))
+    (is (= [["Bob"] ["Dave"]]
+           (run "MATCH (n:users) WHERE NOT n.role = 'admin' RETURN n.name")))
+    (is (= [["Alice"] ["Carol"]]
+           (run "MATCH (n:users) WHERE NOT n.role = 'user' RETURN n.name")))))
+
+(deftest or-binds-looser-than-and
+  (testing "Cypher's precedence: `a OR b AND c` is `a OR (b AND c)`. Parsing
+            both at one level would make it `(a OR b) AND c` — a wrong answer,
+            not a rejected query"
+    (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = 'x' OR n.role = 'y' AND n.works_at = 'd1' RETURN n.name")
+          e (:where ast)]
+      (is (= :or (:kind e)))
+      (is (= 2 (count (:args e))))
+      (is (= :cmp (:kind (first (:args e)))))
+      (is (= :and (:kind (second (:args e)))) "the AND stayed on the right of the OR"))))
+
+(deftest parentheses-override-precedence
+  (let [e (:where (cypher/parse "MATCH (n:users) WHERE (n.role = 'x' OR n.role = 'y') AND n.works_at = 'd1' RETURN n.name"))]
+    (is (= :and (:kind e)))
+    (is (= :or (:kind (first (:args e)))))))
+
+(deftest or-and-not-translate-to-datalog-special-forms
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'a' OR n.role = 'b' RETURN n.name") {})
+        ors (filter #(and (seq? %) (= 'or (first %))) (:where (:query t)))
+        t2 (cypher/translate (cypher/parse "MATCH (n:users) WHERE NOT n.role = 'a' RETURN n.name") {})
+        nots (filter #(and (seq? %) (= 'not (first %))) (:where (:query t2)))]
+    (is (= 1 (count ors)))
+    (is (= 2 (count (rest (first ors)))) "one branch per alternative")
+    (is (= 1 (count nots)))))
+
+(deftest a-comparison-inside-or-or-not-is-refused-by-name
+  (testing "datalog's `or`/`not` branches are ONE clause and bind nothing, and
+            a comparison needs two — bind the property, then constrain the
+            binding. Rejected with the reason rather than mistranslated into
+            something that returns the wrong rows"
+    (doseq [q ["MATCH (n:users) WHERE n.age > 18 OR n.role = 'a' RETURN n.name"
+               "MATCH (n:users) WHERE NOT n.age > 18 RETURN n.name"]]
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                            #"single clause"
+                            (cypher/parse-and-translate-probe q))
+          q))))
+
+(deftest a-nested-group-inside-or-is-refused-by-name
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"single comparison or its"
+                        (cypher/parse-and-translate-probe
+                         "MATCH (n:users) WHERE n.role = 'a' OR (n.role = 'b' AND n.works_at = 'd1') RETURN n.name"))))

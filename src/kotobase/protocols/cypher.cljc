@@ -48,8 +48,15 @@
 
   - exactly one `MATCH` clause, one `RETURN` clause, at most one `WHERE`.
   - every node pattern MUST be labeled (`(n:Label)`, not bare `(n)`).
-  - `WHERE` supports `=`, `<`, `>`, `<=`, `>=` and `<>`, one or more
-    clauses ANDed together -- no `OR`/`NOT`/`IS NULL`/string functions.
+  - `WHERE` is a boolean expression: `=`, `<`, `>`, `<=`, `>=`, `<>`,
+    combined with `AND`, `OR`, `NOT` and parentheses, at Cypher's own
+    precedence (OR looser than AND, AND looser than NOT). No `IS NULL`, no
+    string functions.
+  - **`OR` and `NOT` accept only equalities.** `arrangement.datalog`'s `or`
+    and `not` branches are ONE clause each and bind nothing; a comparison
+    needs two (bind the property, then constrain the binding), so it cannot
+    be a branch. A nested group inside `OR` is refused for the same reason.
+    All three are rejected by name with the reason, never mistranslated.
     `=` translates to a literal IN the triple so the index can probe it; a
     comparison binds the property to a fresh lvar and constrains it with an
     `arrangement.datalog` predicate clause. Same operator family, two very
@@ -168,7 +175,7 @@
           :else (recur (inc i) (str acc c)))))))
 
 (def ^:private keyword-tokens
-  {"MATCH" :match "WHERE" :where "RETURN" :return "AND" :and
+  {"MATCH" :match "WHERE" :where "RETURN" :return "AND" :and "OR" :or "NOT" :not
    "TRUE" :true "FALSE" :false "NULL" :null})
 
 (defn- tokenize
@@ -351,15 +358,48 @@
          op (assoc :op op))
        toks])))
 
+(declare parse-or-expr)
+
+(defn- parse-not-expr
+  "`[NOT] comparison`, or a parenthesised expression."
+  [toks]
+  (cond
+    (= :not (peek-type toks))
+    (let [[e toks] (parse-not-expr (rest toks))]
+      [{:kind :not :arg e} toks])
+
+    (= :lparen (peek-type toks))
+    (let [[e toks] (parse-or-expr (rest toks))]
+      [e (expect toks :rparen)])
+
+    :else
+    (let [[p toks] (parse-predicate toks)]
+      [(assoc p :kind :cmp) toks])))
+
+(defn- parse-and-expr [toks]
+  (loop [[e toks] (parse-not-expr toks) args []]
+    (let [args (conj args e)]
+      (if (= :and (peek-type toks))
+        (recur (parse-not-expr (rest toks)) args)
+        [(if (= 1 (count args)) (first args) {:kind :and :args args}) toks]))))
+
+(defn parse-or-expr
+  "`WHERE` boolean expression. Precedence is Cypher's: OR looser than AND,
+  AND looser than NOT, NOT looser than a comparison. Parsing them at one level
+  would make `a OR b AND c` mean `(a OR b) AND c` -- a wrong answer, not a
+  rejected query."
+  [toks]
+  (loop [[e toks] (parse-and-expr toks) args []]
+    (let [args (conj args e)]
+      (if (= :or (peek-type toks))
+        (recur (parse-and-expr (rest toks)) args)
+        [(if (= 1 (count args)) (first args) {:kind :or :args args}) toks]))))
+
 (defn- parse-where [toks]
   (if (= :where (peek-type toks))
-    (loop [toks (rest toks) preds []]
-      (let [[p toks] (parse-predicate toks)
-            preds (conj preds p)]
-        (if (= :and (peek-type toks))
-          (recur (rest toks) preds)
-          [preds toks])))
-    [[] toks]))
+    (let [[e toks] (parse-or-expr (rest toks))]
+      [e toks])
+    [nil toks]))
 
 (defn- parse-return-item [toks]
   (let [[v toks] (take-ident toks)
@@ -425,6 +465,16 @@
           (throw (syntax-err (str word " expects a non-negative integer, got " v))))
         [v (rest toks)]))))
 
+
+(defn where-leaves
+  "Every comparison leaf in a WHERE expression tree, in written order."
+  [e]
+  (case (:kind e)
+    nil []
+    :cmp [e]
+    :not (where-leaves (:arg e))
+    (:and :or) (into [] (mapcat where-leaves) (:args e))))
+
 (defn parse
   "Parse one Cypher v0.1 statement string into an AST map:
   `{:pattern {:nodes [{:var :label} ...] :rel-type string-or-nil}
@@ -455,7 +505,7 @@
                         (throw (semantic-err
                                 (str "unknown variable '" v "' in " where-desc
                                      " -- not declared in the MATCH pattern")))))]
-      (doseq [p wpreds] (check-var (:var p) "WHERE"))
+      (doseq [p (where-leaves wpreds)] (check-var (:var p) "WHERE"))
       (doseq [r ritems] (check-var (:var r) "RETURN"))
       (doseq [o order-items] (check-var (:var o) "ORDER BY")))
     ;; ORDER BY may only name something RETURN projects. Cypher itself allows
@@ -489,6 +539,65 @@
         (throw (param-err (str "missing parameter: $" pname)))))
     v))
 
+
+(defn- leaf-triple
+  "The single triple an equality leaf becomes, or nil when it is a comparison
+  (which needs two clauses and therefore cannot be one)."
+  [{:keys [var prop value op]} parameters]
+  (when-not op
+    [(var-sym var) (keyword prop) (resolve-value value parameters)]))
+
+(defn- translate-where
+  "WHERE expression tree -> a vector of `arrangement.datalog` clauses.
+
+  `AND` is the shape datalog already has -- a conjunction of clauses -- so it
+  flattens. `OR` and `NOT` become `(or ...)` / `(not ...)` special-form
+  clauses, and both carry a HARD limit that comes from datalog rather than from
+  taste: **each branch is ONE clause and contributes no bindings.** A
+  comparison needs two (bind the property, then constrain the binding), so a
+  comparison inside OR or NOT cannot be expressed at all. Rejected by name,
+  with the reason, rather than silently dropped or quietly mistranslated into
+  something that returns the wrong rows."
+  [e parameters]
+  (case (:kind e)
+    nil []
+
+    :cmp (let [{:keys [var prop value op]} e]
+           (if op
+             (let [cmp (gensym "?__cmp")]
+               [[(var-sym var) (keyword prop) cmp]
+                [(list op cmp (resolve-value value parameters))]])
+             [[(var-sym var) (keyword prop) (resolve-value value parameters)]]))
+
+    :and (into [] (mapcat #(translate-where % parameters)) (:args e))
+
+    :not (let [t (leaf-triple (:arg e) parameters)]
+           (when-not t
+             (throw (semantic-err
+                     (str "NOT is only supported over an equality -- a comparison"
+                          " needs a binding clause and a constraint clause, and a"
+                          " datalog `not` branch is a single clause"))))
+           [(list 'not t)])
+
+    :or (let [branches (mapv (fn [a]
+                               (case (:kind a)
+                                 :cmp (or (leaf-triple a parameters)
+                                          (throw (semantic-err
+                                                  (str "OR is only supported over equalities --"
+                                                       " a comparison needs a binding clause and a"
+                                                       " constraint clause, and a datalog `or`"
+                                                       " branch is a single clause"))))
+                                 :not (let [t (leaf-triple (:arg a) parameters)]
+                                        (when-not t
+                                          (throw (semantic-err "NOT inside OR is only supported over an equality")))
+                                        (list 'not t))
+                                 (throw (semantic-err
+                                         (str "each OR branch must be a single comparison or its"
+                                              " negation -- a nested AND/OR would need a branch of"
+                                              " several clauses, which datalog's `or` does not take")))))
+                             (:args e))]
+          [(cons 'or branches)])))
+
 (defn translate
   "AST (from `parse`) + `parameters` (a string-keyed map -- the JSON-parsed
   `\"parameters\"` object from the request statement) -> a
@@ -512,17 +621,7 @@
         ;; MUST come first: datalog rejects a predicate whose args are not
         ;; already bound by an earlier clause, and that safety check is the
         ;; thing keeping an unbound variable from silently matching everything.
-        where-clauses (into []
-                            (comp (map-indexed
-                                   (fn [i {:keys [var prop value op]}]
-                                     (let [v (resolve-value value parameters)]
-                                       (if op
-                                         (let [cmp (symbol (str "?__cmp" i))]
-                                           [[(var-sym var) (keyword prop) cmp]
-                                            [(list op cmp v)]])
-                                         [[(var-sym var) (keyword prop) v]]))))
-                                  cat)
-                            where)
+        where-clauses (translate-where where parameters)
         return-syms (mapv (fn [{:keys [var prop]}] (symbol (str "?" var "__" prop))) return)
         return-clauses (mapv (fn [{:keys [var prop]} rsym] [(var-sym var) (keyword prop) rsym])
                              return return-syms)
@@ -577,6 +676,12 @@
                   :else (compare (str (type a)) (str (type b))))
               c (if desc? (- c) c)]
           (if (zero? c) (recur (next os)) c))))))
+
+(defn parse-and-translate-probe
+  "parse + translate in one call, for tests that assert on translate-time
+  rejections. Not part of the HTTP path, which catches these into the
+  response error shape."
+  [q] (translate (parse q) {}))
 
 (defn execute
   " Run a `translate`d query descriptor against `store` via

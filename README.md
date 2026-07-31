@@ -92,8 +92,13 @@ MATCH (n:Label) [WHERE n.prop <op> <value> [AND n.prop2 <op> <value2> ...]]
 
 - exactly one `MATCH`, one `RETURN`, at most one `WHERE`.
 - every node pattern **must be labeled** — `(n:Label)`, never bare `(n)`.
-- `WHERE` supports `=` `<` `>` `<=` `>=` `<>`, one or more clauses **AND**ed
-  — no `OR`/`NOT`/`IS NULL`/string functions/regex. `=` puts the literal in
+- `WHERE` is a boolean expression: `=` `<` `>` `<=` `>=` `<>` combined with
+  `AND`, `OR`, `NOT` and parentheses, at Cypher's precedence (OR looser than
+  AND, AND looser than NOT) — no `IS NULL`/string functions/regex.
+- **`OR` and `NOT` accept only equalities**, and say so rather than guessing:
+  `arrangement.datalog`'s `or`/`not` branches are one clause each and bind
+  nothing, while a comparison needs two (bind, then constrain). A comparison
+  or a nested group inside `OR`/`NOT` is a named error. `=` puts the literal in
   the triple so the index can probe it; a comparison binds and then constrains
   via an `arrangement.datalog` predicate clause.
 - `RETURN` projects one or more `var.prop` properties — never a bare node,
