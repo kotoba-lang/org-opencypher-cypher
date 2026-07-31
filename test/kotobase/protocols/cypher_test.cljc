@@ -309,3 +309,68 @@
     (testing "DISTINCT collapses before LIMIT, so LIMIT still returns what was asked"
       (is (= [["admin"] ["user"]]
              (run "MATCH (n:users) RETURN DISTINCT n.role ORDER BY n.role"))))))
+
+;; --- comparison operators in WHERE -----------------------------------------
+
+(defn- numeric-store []
+  (let [s (local/local-store)]
+    (st/-put s "people" "p1" {:name "Alice" :age 30})
+    (st/-put s "people" "p2" {:name "Bob" :age 17})
+    (st/-put s "people" "p3" {:name "Carol" :age 45})
+    s))
+
+(deftest comparisons-parse-into-an-op
+  (doseq [[text op] [["=" nil] ["<" '<] [">" '>] ["<=" '<=] [">=" '>=] ["<>" 'not=]]]
+    (let [ast (cypher/parse (str "MATCH (n:people) WHERE n.age " text " 18 RETURN n.name"))]
+      (is (= op (:op (first (:where ast)))) text)
+      (is (= 18 (:value (first (:where ast))))))))
+
+(deftest equality-stays-a-triple-and-comparison-becomes-a-predicate
+  (testing "same operator family, two very different plans: `=` puts the
+            literal IN the triple so the index can probe it, a comparison has
+            to bind and then constrain"
+    (let [eq (cypher/translate (cypher/parse "MATCH (n:people) WHERE n.age = 30 RETURN n.name") {})
+          gt (cypher/translate (cypher/parse "MATCH (n:people) WHERE n.age > 18 RETURN n.name") {})]
+      (is (some #(= 30 (last %)) (:where (:query eq))) "literal is in the triple")
+      (is (not-any? seq? (map first (:where (:query eq)))) "no predicate clause for =")
+      (let [ws (:where (:query gt))
+            pred (first (filter #(seq? (first %)) ws))]
+        (is (some? pred) "comparison produced a predicate clause")
+        (is (= '> (first (first pred))))
+        (is (= 18 (last (first pred))))
+        (testing "and the binding triple comes BEFORE it -- datalog rejects a
+                  predicate whose args are not already bound, and that check is
+                  what stops an unbound variable matching everything"
+          (let [cmp-var (second (first pred))
+                triple-idx (first (keep-indexed (fn [i c] (when (and (vector? c) (= cmp-var (last c))) i)) ws))
+                pred-idx (first (keep-indexed (fn [i c] (when (seq? (first c)) i)) ws))]
+            (is (< triple-idx pred-idx))))))))
+
+(deftest comparisons-run-end-to-end
+  (let [s (numeric-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Carol"]] (run "MATCH (n:people) WHERE n.age > 18 RETURN n.name")))
+    (is (= [["Bob"]]             (run "MATCH (n:people) WHERE n.age < 18 RETURN n.name")))
+    (is (= [["Alice"] ["Carol"]] (run "MATCH (n:people) WHERE n.age >= 30 RETURN n.name")))
+    (is (= [["Bob"]]             (run "MATCH (n:people) WHERE n.age <= 17 RETURN n.name")))
+    (is (= [["Bob"] ["Carol"]]   (run "MATCH (n:people) WHERE n.age <> 30 RETURN n.name")))
+    (is (= [["Alice"]]           (run "MATCH (n:people) WHERE n.age = 30 RETURN n.name")))))
+
+(deftest comparisons-compose-with-and-and-with-order-limit
+  (let [s (numeric-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"]]
+           (run "MATCH (n:people) WHERE n.age > 18 AND n.age < 40 RETURN n.name")))
+    (is (= [["Carol" 45] ["Alice" 30]]
+           (run "MATCH (n:people) WHERE n.age > 18 RETURN n.name, n.age ORDER BY n.age DESC LIMIT 2"))
+        "two comparisons' worth of rows, then ordered and cut")))
+
+(deftest a-missing-operator-is-a-named-error
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"expected a comparison operator"
+                        (cypher/parse "MATCH (n:people) WHERE n.age 18 RETURN n.name"))))
+
+(deftest two-char-operators-are-not-scanned-as-two-tokens
+  (testing "<= must not scan as < then =, and <> must not scan as < then >"
+    (is (= '<= (:op (first (:where (cypher/parse "MATCH (n:people) WHERE n.age <= 1 RETURN n.name"))))))
+    (is (= 'not= (:op (first (:where (cypher/parse "MATCH (n:people) WHERE n.age <> 1 RETURN n.name"))))))))

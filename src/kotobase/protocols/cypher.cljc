@@ -40,15 +40,20 @@
   ## v0.1 Cypher subset (hard scope boundary, ADR-2607172300)
 
   ```
-  MATCH (n:Label) [WHERE n.prop = <value> [AND n.prop2 = <value2> ...]]
+  MATCH (n:Label) [WHERE n.prop <op> <value> [AND n.prop2 <op> <value2> ...]]
+                   ; <op> is one of  =  <  >  <=  >=  <>
     RETURN [DISTINCT] n.prop1 [, n.prop2 ...]
     [ORDER BY n.propA [ASC|DESC] [, ...]] [SKIP n] [LIMIT n]
   ```
 
   - exactly one `MATCH` clause, one `RETURN` clause, at most one `WHERE`.
   - every node pattern MUST be labeled (`(n:Label)`, not bare `(n)`).
-  - `WHERE` is equality-only (`=`), one or more clauses ANDed together --
-    no `<`/`>`/`<>`/`OR`/`NOT`/`IS NULL`/string functions.
+  - `WHERE` supports `=`, `<`, `>`, `<=`, `>=` and `<>`, one or more
+    clauses ANDed together -- no `OR`/`NOT`/`IS NULL`/string functions.
+    `=` translates to a literal IN the triple so the index can probe it; a
+    comparison binds the property to a fresh lvar and constrains it with an
+    `arrangement.datalog` predicate clause. Same operator family, two very
+    different plans, which is why they are not unified.
   - `RETURN` projects one or more `var.prop` properties -- never a bare
     node/relationship, never `*`, never an alias (`AS`), never an aggregate.
   - `DISTINCT`, `ORDER BY` (per-item `ASC`/`DESC`), `SKIP` and `LIMIT` are
@@ -186,6 +191,17 @@
             (= c ":") (recur (inc i) (conj toks {:type :colon}))
             (= c ".") (recur (inc i) (conj toks {:type :dot}))
             (= c ",") (recur (inc i) (conj toks {:type :comma}))
+            ;; Two-char comparisons MUST be tested before the single-char
+            ;; ones, or "<=" scans as "<" followed by "=" and Cypher's "<>"
+            ;; becomes "<" followed by ">".
+            (and (= c "<") (= (subs s (inc i) (min n (+ i 2))) "="))
+            (recur (+ i 2) (conj toks {:type :lte}))
+            (and (= c "<") (= (subs s (inc i) (min n (+ i 2))) ">"))
+            (recur (+ i 2) (conj toks {:type :neq}))
+            (and (= c ">") (= (subs s (inc i) (min n (+ i 2))) "="))
+            (recur (+ i 2) (conj toks {:type :gte}))
+            (= c "<") (recur (inc i) (conj toks {:type :lt}))
+            (= c ">") (recur (inc i) (conj toks {:type :gt}))
             (= c "=") (recur (inc i) (conj toks {:type :eq}))
             (= c "*") (recur (inc i) (conj toks {:type :star}))
             (= c "-")
@@ -224,6 +240,7 @@
     :ident (str "identifier '" (:val t) "'")
     :string "string literal"
     :number (str "number " (:val t))
+    :lt "'<'" :gt "'>'" :lte "'<='" :gte "'>='" :neq "'<>'"
     :param (str "parameter '$" (:val t) "'")
     nil "end of input"
     (name (:type t))))
@@ -310,13 +327,29 @@
               (str "expected a value (string, number, true/false, null, or $parameter), got "
                    (describe-tok t)))))))
 
+(def ^:private comparison-ops
+  "Cypher comparison token -> the `arrangement.datalog` whitelisted function
+  the translated predicate clause calls.
+
+  `=` is deliberately NOT in here: an equality predicate translates to a
+  literal in the triple itself, which the index can look up directly, and
+  routing it through a predicate clause would turn an index probe into a scan
+  plus a filter. Same operator, two very different plans."
+  {:lt '< :gt '> :lte '<= :gte '>= :neq 'not=})
+
 (defn- parse-predicate [toks]
   (let [[v toks] (take-ident toks)
         toks (expect toks :dot)
         [prop toks] (take-ident toks)
-        toks (expect toks :eq)
-        [val toks] (parse-value toks)]
-    [{:var v :prop prop :value val} toks]))
+        op-type (peek-type toks)
+        op (get comparison-ops op-type)]
+    (when-not (or op (= :eq op-type))
+      (throw (syntax-err (str "expected a comparison operator (=, <, >, <=, >=, <>)"
+                              " after " v "." prop " -- got " (describe-tok (first toks))))))
+    (let [[val toks] (parse-value (rest toks))]
+      [(cond-> {:var v :prop prop :value val}
+         op (assoc :op op))
+       toks])))
 
 (defn- parse-where [toks]
   (if (= :where (peek-type toks))
@@ -472,8 +505,23 @@
                             fk-var (symbol (str "?__fk_" (:var a) "_" (:var b)))]
                         [[(var-sym (:var a)) fk fk-var]
                          [(var-sym (:var b)) :kotobase/key fk-var]]))
-        where-clauses (mapv (fn [{:keys [var prop value]}]
-                              [(var-sym var) (keyword prop) (resolve-value value parameters)])
+        ;; Equality stays a literal IN the triple, so the index can probe it.
+        ;; A comparison cannot be a triple at all -- it binds the property to a
+        ;; fresh lvar and then constrains that lvar with one of
+        ;; `arrangement.datalog`'s whitelisted predicate clauses. The triple
+        ;; MUST come first: datalog rejects a predicate whose args are not
+        ;; already bound by an earlier clause, and that safety check is the
+        ;; thing keeping an unbound variable from silently matching everything.
+        where-clauses (into []
+                            (comp (map-indexed
+                                   (fn [i {:keys [var prop value op]}]
+                                     (let [v (resolve-value value parameters)]
+                                       (if op
+                                         (let [cmp (symbol (str "?__cmp" i))]
+                                           [[(var-sym var) (keyword prop) cmp]
+                                            [(list op cmp v)]])
+                                         [[(var-sym var) (keyword prop) v]]))))
+                                  cat)
                             where)
         return-syms (mapv (fn [{:keys [var prop]}] (symbol (str "?" var "__" prop))) return)
         return-clauses (mapv (fn [{:keys [var prop]} rsym] [(var-sym var) (keyword prop) rsym])
