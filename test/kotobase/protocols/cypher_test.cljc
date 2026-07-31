@@ -530,3 +530,76 @@
         run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
     (is (= [["Alice"] ["Bob"] ["Carol"] ["Dave"]]
            (run "MATCH (n:users) RETURN n.name AS who ORDER BY n.name")))))
+
+;; --- label -> collection resolution ----------------------------------------
+;; The gap this closes was found in deployment, not in review: net-kotobase
+;; serves this surface beside kotobase.protocols.s3, whose collection keys are
+;; [:kotobase.s3/objects bucket]. A document PUT to /s3/users/u1 round-tripped
+;; through GET and was invisible to MATCH (n:users), because the label was
+;; used verbatim as a collection name and no collection is called "users".
+
+(defn- vector-keyed-store
+  "What kotobase.protocols.s3 actually writes: one bucket, vector-keyed."
+  []
+  (let [s (local/local-store)]
+    (st/-put s [:kotobase.s3/objects "users"] "u1" {:name "Alice" :role "admin"})
+    (st/-put s [:kotobase.s3/objects "users"] "u2" {:name "Bob" :role "user"})
+    s))
+
+(deftest leaf-name-of-each-key-shape
+  (is (= "users" (cypher/leaf-name "users")))
+  (is (= "users" (cypher/leaf-name :users)))
+  (is (= "users" (cypher/leaf-name [:kotobase.s3/objects "users"])))
+  (is (= "users" (cypher/leaf-name [:kotobase.at/records "did:x" :users]))))
+
+(deftest label-resolves-to-a-vector-keyed-collection
+  (is (= [:kotobase.s3/objects "users"]
+         (cypher/resolve-label [[:kotobase.s3/objects "users"]] "users"))))
+
+(deftest an-exact-key-wins-over-a-leaf-match
+  (is (= "users"
+         (cypher/resolve-label ["users" [:kotobase.s3/objects "users"]] "users"))))
+
+(deftest an-unmatched-label-is-left-alone
+  (is (= "absent" (cypher/resolve-label [[:kotobase.s3/objects "users"]] "absent"))))
+
+(deftest no-available-collections-means-no-resolution
+  (is (= "users" (cypher/resolve-label nil "users")))
+  (is (= "users" (cypher/resolve-label [] "users"))))
+
+(deftest an-ambiguous-leaf-refuses-rather-than-picks
+  (let [avail [[:kotobase.s3/objects "users"] [:kotobase.at/records "did:x" "users"]]
+        e (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                       (cypher/resolve-label avail "users")))]
+    (is (= 2 (count (:candidates (ex-data e)))))
+    (is (= "Neo.ClientError.Statement.SemanticError" (:cypher/code (ex-data e))))))
+
+(deftest resolution-moves-coll-keys-and-clauses-together
+  ;; A translation whose :coll-keys were rewritten but whose :kotobase/coll
+  ;; clauses were not would materialize the right documents and then match
+  ;; none of them -- an empty result, not an error.
+  (let [avail [[:kotobase.s3/objects "users"]]
+        t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.name") {})
+        r (cypher/resolve-collections avail t)]
+    (is (= [[:kotobase.s3/objects "users"]] (:coll-keys r)))
+    ;; The clause carries the STRINGIFIED key, because that is what
+    ;; bridge/materialize asserts as :kotobase/coll. The two sides of the
+    ;; substitution are deliberately not the same value.
+    (is (some (fn [c] (= (str [:kotobase.s3/objects "users"]) (nth c 2)))
+              (filter (fn [c] (and (vector? c) (= 3 (count c))
+                                   (= :kotobase/coll (nth c 1))))
+                      (get-in r [:query :where]))))))
+
+(deftest a-vector-keyed-collection-is-queryable-end-to-end
+  (let [s (vector-keyed-store)
+        t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name") {})]
+    (is (= [] (cypher/execute s t everything))
+        "verbatim: no collection is named \"users\"")
+    (is (= [["Alice"]]
+           (cypher/execute {:coll-keys [[:kotobase.s3/objects "users"]]} s t everything)))))
+
+(deftest resolution-does-not-disturb-string-keyed-collections
+  (let [s (fixture-store)
+        t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name") {})]
+    (is (= (cypher/execute s t everything)
+           (cypher/execute {:coll-keys ["users" "departments"]} s t everything)))))

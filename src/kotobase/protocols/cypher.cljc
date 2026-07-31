@@ -98,10 +98,33 @@
 
   ## Label -> collection mapping
 
-  A Cypher label is used VERBATIM as the `kotobase.store` collection name
-  materialized via `kotobase.query.bridge/materialize` -- `(n:users)`
-  queries the `\"users\"` collection exactly. No case-folding, no
-  pluralization, no other transform. Document collections accordingly.
+  A Cypher label names a `kotobase.store` collection materialized via
+  `kotobase.query.bridge/materialize`. A label that IS a collection key is used
+  verbatim -- `(n:users)` queries the `\"users\"` collection exactly, with no
+  case-folding, pluralization or other transform.
+
+  `kotobase.store` collection keys are not all strings, though, and that is
+  not a corner case: `kotobase.protocols.s3` keys its objects
+  `[:kotobase.s3/objects bucket]` and `kotobase.protocols.atproto` keys its
+  records `[:kotobase.at/records did nsid]`. Cypher has no syntax for a vector
+  label, so a deployment serving those alongside this surface had a Cypher that
+  could not address a single thing its own write paths had created.
+
+  So when `ctx` carries `:coll-keys` -- the collections that actually exist --
+  a label that is not itself a key is resolved against them by LEAF NAME: the
+  last element of a vector key, `name` of a keyword. `(n:users)` finds
+  `[:kotobase.s3/objects \"users\"]`. Resolution is by exact leaf equality and
+  nothing fuzzier.
+
+  Two labels can share a leaf (`[:kotobase.s3/objects \"users\"]` and
+  `[:kotobase.at/records \"did:x\" \"users\"]`). That is reported as an error
+  naming both candidates, not resolved by preferring one -- a query whose
+  meaning depends on which collection a bare label happened to pick is worse
+  than a query that refuses to run. A label matching nothing is left verbatim
+  and materializes empty, which is what it did before.
+
+  With no `:coll-keys` in `ctx` -- the 3-arity `execute`, every existing test --
+  nothing is resolved and the label is used verbatim, as it always was.
 
   ## Bonus: relationship patterns (real cross-collection join, not required
   by v0.1 but implemented since it maps naturally onto the bridge's join
@@ -595,6 +618,66 @@
 
 ;; ------------------------------------------------------------ translate
 
+(defn leaf-name
+  "The bare name a collection key is addressable by from Cypher: the last
+  element of a vector key, `name` of a keyword, a string as itself."
+  [k]
+  (cond
+    (vector? k) (some-> (last k) leaf-name)
+    (keyword? k) (name k)
+    :else (str k)))
+
+(defn resolve-label
+  "A Cypher label -> the `kotobase.store` collection key it names, given
+  `available` (the keys that exist). See the ns docstring's label section.
+
+  Returns the label unchanged when `available` is empty (no ctx said what
+  exists), when the label is itself a key, or when nothing matches. Throws on
+  an ambiguous leaf rather than choosing."
+  [available label]
+  (let [available (seq available)]
+    (if-not available
+      label
+      (if (some #(= % label) available)
+        label
+        (let [matches (filterv #(= (leaf-name %) label) available)]
+          (case (count matches)
+            0 label
+            1 (first matches)
+            (throw (ex-info (str "label " (pr-str label) " is ambiguous: it names "
+                                 (count matches) " collections (" (pr-str matches)
+                                 "). Cypher has no syntax to disambiguate them, so "
+                                 "this query cannot be run as written.")
+                            {:cypher/code "Neo.ClientError.Statement.SemanticError"
+                             :label label
+                             :candidates matches}))))))))
+
+(defn resolve-collections
+  "Rewrite a translation so every label names a collection that exists.
+
+  Both places a label appears have to move together -- `:coll-keys` decides
+  what gets materialized and the `:kotobase/coll` clauses decide what matches
+  once it has -- so they are substituted from one map rather than resolved
+  twice. They do not take the same VALUE, though: `bridge/materialize` asserts
+  `{:p :kotobase/coll :o (str coll)}`, so the clause wants the stringified key
+  and `:coll-keys` wants the real one. That difference is invisible while every
+  key is a string, which is exactly why it is worth a sentence."
+  [available {:keys [coll-keys query] :as translated}]
+  (if-not (seq available)
+    translated
+    (let [sub (into {} (map (juxt identity #(resolve-label available %))) coll-keys)]
+      (-> translated
+          (assoc :coll-keys (into [] (comp (map #(get sub % %)) (distinct)) coll-keys))
+          (assoc :query
+                 (update query :where
+                         (fn [clauses]
+                           (mapv (fn [c]
+                                   (if (and (vector? c) (= 3 (count c))
+                                            (= :kotobase/coll (nth c 1)))
+                                     (assoc c 2 (str (get sub (nth c 2) (nth c 2))))
+                                     c))
+                                 clauses))))))))
+
 (defn- var-sym [v] (symbol (str "?" v)))
 
 (defn- fk-attr
@@ -891,8 +974,10 @@
   what this function has always done: the bridge does not promise an order and
   an unstable result set is worse than an arbitrary but repeatable one."
   ([store translated visible?] (execute {} store translated visible?))
-  ([ctx store {:keys [coll-keys query distinct? order-by skip limit project]} visible?]
-  (let [;; The bridge yields each row as a SEQ, not a vector -- indexed access
+  ([ctx store translated visible?]
+  (let [{:keys [coll-keys query distinct? order-by skip limit project]}
+        (resolve-collections (:coll-keys ctx) translated)
+        ;; The bridge yields each row as a SEQ, not a vector -- indexed access
         ;; is what ORDER BY needs and `nth` does not work on one. The old
         ;; stringified sort only ever used `mapv`, so this never showed until
         ;; there was a comparator that reads a column by position.
