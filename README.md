@@ -84,15 +84,18 @@ namespace.
 ## v0.1 Cypher subset — hard scope boundary
 
 ```
-MATCH (n:Label) [WHERE n.prop = <value> [AND n.prop2 = <value2> ...]]
+MATCH (n:Label) [WHERE n.prop <op> <value> [AND n.prop2 <op> <value2> ...]]
+                 ; <op> is one of  =  <  >  <=  >=  <>
   RETURN [DISTINCT] n.prop1 [, n.prop2 ...]
   [ORDER BY n.propA [ASC|DESC] [, ...]] [SKIP n] [LIMIT n]
 ```
 
 - exactly one `MATCH`, one `RETURN`, at most one `WHERE`.
 - every node pattern **must be labeled** — `(n:Label)`, never bare `(n)`.
-- `WHERE` is **equality only** (`=`), one or more clauses **AND**ed — no
-  `<`/`>`/`<>`/`OR`/`NOT`/`IS NULL`/string functions/regex.
+- `WHERE` supports `=` `<` `>` `<=` `>=` `<>`, one or more clauses **AND**ed
+  — no `OR`/`NOT`/`IS NULL`/string functions/regex. `=` puts the literal in
+  the triple so the index can probe it; a comparison binds and then constrains
+  via an `arrangement.datalog` predicate clause.
 - `RETURN` projects one or more `var.prop` properties — never a bare node,
   never `*`, never `AS` aliasing, never an aggregate.
 - `DISTINCT`, `ORDER BY` (per-item `ASC`/`DESC`), `SKIP` and `LIMIT` are
