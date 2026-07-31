@@ -40,9 +40,11 @@
   ## v0.1 Cypher subset (hard scope boundary, ADR-2607172300)
 
   ```
-  MATCH (n:Label) [WHERE n.prop <op> <value> [AND n.prop2 <op> <value2> ...]]
-                   ; <op> is one of  =  <  >  <=  >=  <>
-    RETURN [DISTINCT] n.prop1 [, n.prop2 ...]
+  MATCH (a:A)[-[:REL]->(b:B) ...]      ; any number of hops, rightward only
+    [WHERE <boolean expression>]         ; = < > <= >= <> CONTAINS IS [NOT] NULL
+                                         ; combined with AND / OR / NOT / ( )
+    RETURN [DISTINCT] <item> [AS alias] [, ...]
+                                         ; <item> is n.prop, count(*), count(n.prop)
     [ORDER BY n.propA [ASC|DESC] [, ...]] [SKIP n] [LIMIT n]
   ```
 
@@ -52,11 +54,23 @@
     combined with `AND`, `OR`, `NOT` and parentheses, at Cypher's own
     precedence (OR looser than AND, AND looser than NOT). No `IS NULL`, no
     string functions.
-  - **`OR` and `NOT` accept only equalities.** `arrangement.datalog`'s `or`
-    and `not` branches are ONE clause each and bind nothing; a comparison
-    needs two (bind the property, then constrain the binding), so it cannot
-    be a branch. A nested group inside `OR` is refused for the same reason.
-    All three are rejected by name with the reason, never mistranslated.
+  - `OR` branches may be conjunctions, because `arrangement.datalog` takes
+    `(and ...)` as a branch since kotoba-lang/arrangement#13 -- so a
+    comparison, `IS NULL`, or a parenthesised group inside `OR` all work.
+  - **`NOT` negates the OPERATOR rather than wrapping a datalog `not`.**
+    Cypher's logic is three-valued: `NOT n.age > 18` on a node with no `age`
+    is `NOT NULL`, which is NULL, which does not match. Operator negation
+    keeps that; a `(not [e a v])` would INCLUDE those rows, which is a
+    different query. `NOT` over a predicate with no negated form (CONTAINS)
+    is refused by name rather than guessed.
+  - `IS NULL` asks about ABSENCE. Neither Cypher nor this store distinguishes
+    a missing property from a null one -- `doc->datoms` emits no datom for a
+    nil -- so there is one answer and not two.
+  - **`count` counts NODES, not distinct values.** datalog has set semantics,
+    so the entity variables go into `:find` whenever an aggregate is present;
+    without them `count(n.role)` over four users holding two roles would be 2.
+    It is still a count of DISTINCT solutions, which differs from real
+    Cypher's bag exactly where someone is counting duplicates on purpose.
     `=` translates to a literal IN the triple so the index can probe it; a
     comparison binds the property to a fresh lvar and constrains it with an
     `arrangement.datalog` predicate clause. Same operator family, two very
@@ -175,7 +189,7 @@
           :else (recur (inc i) (str acc c)))))))
 
 (def ^:private keyword-tokens
-  {"MATCH" :match "WHERE" :where "RETURN" :return "AND" :and "OR" :or "NOT" :not
+  {"MATCH" :match "WHERE" :where "RETURN" :return "AND" :and "OR" :or "NOT" :not "IS" :is
    "TRUE" :true "FALSE" :false "NULL" :null})
 
 (defn- tokenize
@@ -306,16 +320,19 @@
                             (describe-tok (first toks))))))]
     [reltype toks]))
 
-(defn- parse-pattern [toks]
-  (let [[n1 toks] (parse-node toks)]
-    (if (= :dash (peek-type toks))
-      (let [[reltype toks] (parse-rel toks)
-            [n2 toks] (parse-node toks)]
-        (if (= :dash (peek-type toks))
-          (throw (syntax-err
-                  "path patterns with more than one relationship (multi-hop) are not supported in v0.1"))
-          [{:nodes [n1 n2] :rel-type reltype} toks]))
-      [{:nodes [n1] :rel-type nil} toks])))
+(defn- parse-pattern
+  "`(a:A)-[:R]->(b:B)-[:S]->(c:C)` -> `{:nodes [...] :rels [reltype ...]}`.
+
+  `:rels` has exactly one fewer entry than `:nodes`, so hop i joins node i to
+  node i+1. A single node is `{:nodes [n] :rels []}`, which is the shape every
+  caller already handled as `:rel-type nil`."
+  [toks]
+  (loop [[n toks] (parse-node toks) nodes [] rels []]
+    (let [nodes (conj nodes n)]
+      (if (= :dash (peek-type toks))
+        (let [[reltype toks] (parse-rel toks)]
+          (recur (parse-node toks) nodes (conj rels reltype)))
+        [{:nodes nodes :rels rels} toks]))))
 
 (defn- parse-value [toks]
   (let [t (first toks)]
@@ -344,19 +361,49 @@
   plus a filter. Same operator, two very different plans."
   {:lt '< :gt '> :lte '<= :gte '>= :neq 'not=})
 
+(def ^:private string-fns
+  "Cypher-ish string predicates, mapped onto `arrangement.datalog`'s whitelist.
+
+  `CONTAINS`/`STARTS WITH`/`ENDS WITH` are Cypher's own spelling; the single
+  identifier form is accepted for `CONTAINS` only, since the other two are two
+  words in Cypher and splitting them here would invent syntax."
+  {"CONTAINS" 'includes?})
+
 (defn- parse-predicate [toks]
   (let [[v toks] (take-ident toks)
         toks (expect toks :dot)
         [prop toks] (take-ident toks)
         op-type (peek-type toks)
         op (get comparison-ops op-type)]
-    (when-not (or op (= :eq op-type))
-      (throw (syntax-err (str "expected a comparison operator (=, <, >, <=, >=, <>)"
-                              " after " v "." prop " -- got " (describe-tok (first toks))))))
-    (let [[val toks] (parse-value (rest toks))]
-      [(cond-> {:var v :prop prop :value val}
-         op (assoc :op op))
-       toks])))
+    (cond
+      ;; `IS NULL` / `IS NOT NULL` -- absence, not a stored nil. Cypher treats a
+      ;; missing property and a null one the same way, and this store cannot
+      ;; hold the difference either: `doc->datoms` emits no datom for a nil.
+      (= :is op-type)
+      (let [toks (rest toks)
+            negated? (= :not (peek-type toks))
+            toks (if negated? (rest toks) toks)]
+        (when-not (= :null (peek-type toks))
+          (throw (syntax-err (str "expected NULL after IS" (when negated? " NOT")
+                                  " -- got " (describe-tok (first toks))))))
+        [{:var v :prop prop :kind :cmp :null? (not negated?)} (rest toks)])
+
+      (and (= :ident op-type)
+           (contains? string-fns (str/upper-case (str (:val (first toks))))))
+      (let [f (get string-fns (str/upper-case (str (:val (first toks)))))
+            [val toks] (parse-value (rest toks))]
+        [{:var v :prop prop :op f :value val} toks])
+
+      (or op (= :eq op-type))
+      (let [[val toks] (parse-value (rest toks))]
+        [(cond-> {:var v :prop prop :value val}
+           op (assoc :op op))
+         toks])
+
+      :else
+      (throw (syntax-err (str "expected a comparison operator (=, <, >, <=, >=, <>),"
+                              " CONTAINS, or IS [NOT] NULL after " v "." prop
+                              " -- got " (describe-tok (first toks))))))))
 
 (declare parse-or-expr)
 
@@ -401,11 +448,35 @@
       [e toks])
     [nil toks]))
 
-(defn- parse-return-item [toks]
-  (let [[v toks] (take-ident toks)
-        toks (expect toks :dot)
-        [prop toks] (take-ident toks)]
-    [{:var v :prop prop} toks]))
+(declare kw-ident?)
+
+(defn- parse-return-item
+  "One RETURN projection: `var.prop`, `count(*)`, or `count(var.prop)`,
+  optionally `AS alias`.
+
+  `count` is the only aggregate. Cypher has many; implementing one and naming
+  it is better than implementing a family badly, and the grouping rule below is
+  the part that generalises."
+  [toks]
+  (let [agg? (and (= :ident (peek-type toks))
+                  (= "COUNT" (str/upper-case (str (:val (first toks)))))
+                  (= :lparen (:type (second toks))))
+        [item toks]
+        (if agg?
+          (let [toks (rest (rest toks))]
+            (if (= :star (peek-type toks))
+              [{:agg 'count :star? true} (expect (rest toks) :rparen)]
+              (let [[v toks] (take-ident toks)
+                    toks (expect toks :dot)
+                    [prop toks] (take-ident toks)]
+                [{:agg 'count :var v :prop prop} (expect toks :rparen)])))
+          (let [[v toks] (take-ident toks)
+                toks (expect toks :dot)
+                [prop toks] (take-ident toks)]
+            [{:var v :prop prop} toks]))
+        alias? (kw-ident? toks "AS")
+        [alias toks] (if alias? (take-ident (rest toks)) [nil toks])]
+    [(cond-> item alias (assoc :as alias)) toks]))
 
 (defn- parse-return [toks]
   (let [toks (expect toks :return)
@@ -477,7 +548,7 @@
 
 (defn parse
   "Parse one Cypher v0.1 statement string into an AST map:
-  `{:pattern {:nodes [{:var :label} ...] :rel-type string-or-nil}
+  `{:pattern {:nodes [{:var :label} ...] :rels [rel-type ...]}
     :where [{:var :prop :value} ...]
     :return [{:var :prop} ...]}`.
 
@@ -506,13 +577,14 @@
                                 (str "unknown variable '" v "' in " where-desc
                                      " -- not declared in the MATCH pattern")))))]
       (doseq [p (where-leaves wpreds)] (check-var (:var p) "WHERE"))
-      (doseq [r ritems] (check-var (:var r) "RETURN"))
+      ;; `count(*)` names no variable, so there is nothing to check for it.
+      (doseq [r ritems :when (:var r)] (check-var (:var r) "RETURN"))
       (doseq [o order-items] (check-var (:var o) "ORDER BY")))
     ;; ORDER BY may only name something RETURN projects. Cypher itself allows
     ;; ordering by an unreturned expression, but that needs the sort key in the
     ;; result set and then dropped again -- a real feature, not a parse tweak.
     ;; Rejected explicitly rather than silently ignored.
-    (let [returned (into #{} (map (juxt :var :prop)) ritems)]
+    (let [returned (into #{} (comp (filter :var) (map (juxt :var :prop))) ritems)]
       (doseq [{:keys [var prop]} order-items]
         (when-not (contains? returned [var prop])
           (throw (semantic-err
@@ -540,63 +612,101 @@
     v))
 
 
-(defn- leaf-triple
-  "The single triple an equality leaf becomes, or nil when it is a comparison
-  (which needs two clauses and therefore cannot be one)."
-  [{:keys [var prop value op]} parameters]
-  (when-not op
-    [(var-sym var) (keyword prop) (resolve-value value parameters)]))
+(defn- cmp-clauses
+  "The datalog clauses one comparison leaf becomes.
+
+  Equality is a single triple with the literal in it, which the index probes.
+  `IS NULL` is `(not [?e :prop _])` -- absence, since neither Cypher nor this
+  store distinguishes a missing property from a null one. Everything else binds
+  the property to a fresh lvar and constrains it, which is TWO clauses."
+  [{:keys [var prop value op null?]} parameters]
+  (let [v (var-sym var) a (keyword prop)]
+    (cond
+      (true? null?)  [(list 'not [v a '_])]
+      (false? null?) [[v a '_]]
+      op (let [cmp (gensym "?__cmp")]
+           [[v a cmp] [(list op cmp (resolve-value value parameters))]])
+      :else [[v a (resolve-value value parameters)]])))
+
+(def ^:private negated-op
+  " Operator negation, for pushing NOT down to the leaves.
+
+  Cypher's logic is three-valued: `NOT n.age > 18` on a node with no `age` is
+  `NOT NULL`, which is NULL, which does not match. Negating the OPERATOR keeps
+  that -- the property still has to exist -- whereas wrapping the whole
+  comparison in a datalog `not` would INCLUDE the rows missing it, which is a
+  different query. Equality is negated the same way and for the same reason,
+  rather than becoming `(not [e a v])`."
+  {'< '>=, '> '<=, '<= '>, '>= '<, 'not= nil, 'includes? nil})
+
+(defn- negate
+  " Push a NOT down to the leaves (De Morgan), so the clauses handed to datalog
+  never need a negated conjunction -- which `arrangement.datalog`'s `not` does
+  not take, and which would have the wrong three-valued semantics anyway.
+
+  `IS NULL` flips to `IS NOT NULL`. A predicate with no operator negation
+  available (CONTAINS, and `<>` which has no dedicated form here) becomes an
+  explicit refusal rather than a guess."
+  [e]
+  (case (:kind e)
+    :and {:kind :or  :args (mapv negate (:args e))}
+    :or  {:kind :and :args (mapv negate (:args e))}
+    :not (:arg e)
+    :cmp (let [{:keys [op null?]} e]
+           (cond
+             (some? null?) (assoc e :null? (not null?))
+             (nil? op)     (assoc e :op 'not= )
+             (= 'not= op)  (dissoc e :op)
+             (contains? negated-op op)
+             (if-let [n (get negated-op op)]
+               (assoc e :op n)
+               (throw (semantic-err
+                       (str "NOT over " op " is not supported -- there is no negated form"
+                            " of it in the whitelisted predicate set, and guessing one"
+                            " would change which rows come back"))))
+             :else (throw (semantic-err (str "NOT over " op " is not supported")))))))
+
+(declare branch-clause*)
+
+(defn- branch-clause
+  "One `or`/`not` branch as a SINGLE datalog clause.
+
+  A leaf that needs several clauses is wrapped in `(and ...)`, which
+  `arrangement.datalog` takes as a conjunction branch -- so a comparison, or
+  `IS NULL`, inside a disjunction is expressible now. This is what the earlier
+  'OR is only supported over equalities' error existed to refuse; the
+  limitation was the engine's, and it is gone."
+  [e parameters]
+  (case (:kind e)
+    :cmp (let [cs (cmp-clauses e parameters)]
+           (if (= 1 (count cs)) (first cs) (cons 'and cs)))
+    :not (branch-clause (negate (:arg e)) parameters)
+    :and (cons 'and (into [] (mapcat #(branch-clause* % parameters)) (:args e)))
+    :or  (cons 'or (mapv #(branch-clause % parameters) (:args e)))))
+
+(defn- branch-clause*
+  "`branch-clause` flattened: an `(and ...)` contributes its members rather
+  than nesting, so a nested AND inside an OR branch does not build a tower."
+  [e parameters]
+  (let [c (branch-clause e parameters)]
+    (if (and (seq? c) (= 'and (first c))) (rest c) [c])))
 
 (defn- translate-where
   "WHERE expression tree -> a vector of `arrangement.datalog` clauses.
 
-  `AND` is the shape datalog already has -- a conjunction of clauses -- so it
-  flattens. `OR` and `NOT` become `(or ...)` / `(not ...)` special-form
-  clauses, and both carry a HARD limit that comes from datalog rather than from
-  taste: **each branch is ONE clause and contributes no bindings.** A
-  comparison needs two (bind the property, then constrain the binding), so a
-  comparison inside OR or NOT cannot be expressed at all. Rejected by name,
-  with the reason, rather than silently dropped or quietly mistranslated into
-  something that returns the wrong rows."
+  Top level is a conjunction, which is the shape `:where` already is, so `AND`
+  flattens. `OR` and `NOT` become `(or ...)` / `(not ...)`, and their branches
+  may now be `(and ...)` conjunctions -- so a comparison inside a disjunction
+  works. That needed `arrangement.datalog` to accept multi-clause branches; it
+  does since kotoba-lang/arrangement#13, and this file's previous 'only
+  equalities' refusal is deleted rather than merely relaxed."
   [e parameters]
   (case (:kind e)
     nil []
-
-    :cmp (let [{:keys [var prop value op]} e]
-           (if op
-             (let [cmp (gensym "?__cmp")]
-               [[(var-sym var) (keyword prop) cmp]
-                [(list op cmp (resolve-value value parameters))]])
-             [[(var-sym var) (keyword prop) (resolve-value value parameters)]]))
-
+    :cmp (cmp-clauses e parameters)
     :and (into [] (mapcat #(translate-where % parameters)) (:args e))
-
-    :not (let [t (leaf-triple (:arg e) parameters)]
-           (when-not t
-             (throw (semantic-err
-                     (str "NOT is only supported over an equality -- a comparison"
-                          " needs a binding clause and a constraint clause, and a"
-                          " datalog `not` branch is a single clause"))))
-           [(list 'not t)])
-
-    :or (let [branches (mapv (fn [a]
-                               (case (:kind a)
-                                 :cmp (or (leaf-triple a parameters)
-                                          (throw (semantic-err
-                                                  (str "OR is only supported over equalities --"
-                                                       " a comparison needs a binding clause and a"
-                                                       " constraint clause, and a datalog `or`"
-                                                       " branch is a single clause"))))
-                                 :not (let [t (leaf-triple (:arg a) parameters)]
-                                        (when-not t
-                                          (throw (semantic-err "NOT inside OR is only supported over an equality")))
-                                        (list 'not t))
-                                 (throw (semantic-err
-                                         (str "each OR branch must be a single comparison or its"
-                                              " negation -- a nested AND/OR would need a branch of"
-                                              " several clauses, which datalog's `or` does not take")))))
-                             (:args e))]
-          [(cons 'or branches)])))
+    :not (translate-where (negate (:arg e)) parameters)
+    :or  [(cons 'or (mapv #(branch-clause % parameters) (:args e)))]))
 
 (defn translate
   "AST (from `parse`) + `parameters` (a string-keyed map -- the JSON-parsed
@@ -606,14 +716,21 @@
   `:columns` in `:find`/row order (`\"n.prop\"` strings, Neo4j-style)."
   [{:keys [pattern where return distinct? order-by skip limit]} parameters]
   (let [nodes (:nodes pattern)
-        rel-type (:rel-type pattern)
+        rels (:rels pattern)
         node-clauses (mapv (fn [{:keys [var label]}] [(var-sym var) :kotobase/coll label]) nodes)
-        rel-clauses (when rel-type
-                      (let [[a b] nodes
-                            fk (fk-attr rel-type)
-                            fk-var (symbol (str "?__fk_" (:var a) "_" (:var b)))]
-                        [[(var-sym (:var a)) fk fk-var]
-                         [(var-sym (:var b)) :kotobase/key fk-var]]))
+        ;; One join per hop. Each carries its own foreign-key lvar, named after
+        ;; the pair it joins so a three-hop pattern cannot collide with itself.
+        rel-clauses (into []
+                          (comp (map-indexed
+                                 (fn [i reltype]
+                                   (let [a (nth nodes i)
+                                         b (nth nodes (inc i))
+                                         fk (fk-attr reltype)
+                                         fk-var (symbol (str "?__fk" i "_" (:var a) "_" (:var b)))]
+                                     [[(var-sym (:var a)) fk fk-var]
+                                      [(var-sym (:var b)) :kotobase/key fk-var]])))
+                                cat)
+                          rels)
         ;; Equality stays a literal IN the triple, so the index can probe it.
         ;; A comparison cannot be a triple at all -- it binds the property to a
         ;; fresh lvar and then constrains that lvar with one of
@@ -622,10 +739,31 @@
         ;; already bound by an earlier clause, and that safety check is the
         ;; thing keeping an unbound variable from silently matching everything.
         where-clauses (translate-where where parameters)
-        return-syms (mapv (fn [{:keys [var prop]}] (symbol (str "?" var "__" prop))) return)
+        ;; `count(*)` projects nothing -- it counts rows -- so it contributes no
+        ;; find symbol and no clause. Everything else binds its property.
+        bound (filterv #(not (:star? %)) return)
+        ;; With an aggregate present, the ENTITY vars go into :find as well.
+        ;; datalog has set semantics, so `RETURN count(n.works_at)` over three
+        ;; users sharing two departments would otherwise project {d1 d2} and
+        ;; count 2. Binding the entity keeps one solution per matched node,
+        ;; which is what Cypher counts. They are dropped again by `:project`.
+        agg? (boolean (some #(or (:agg %) (:star? %)) return))
+        entity-syms (if agg? (mapv (comp var-sym :var) nodes) [])
+        ;; Kept separate: zipping `bound` against the FULL find list pairs the
+        ;; first projection with an ENTITY symbol and emits `[?n :role ?n]`,
+        ;; which matches nothing. mapv stops at the shorter collection, so the
+        ;; mistake is silent — an empty result rather than an error.
+        prop-syms (mapv (fn [{:keys [var prop]}] (symbol (str "?" var "__" prop))) bound)
+        return-syms (into entity-syms prop-syms)
         return-clauses (mapv (fn [{:keys [var prop]} rsym] [(var-sym var) (keyword prop) rsym])
-                             return return-syms)
-        columns (mapv (fn [{:keys [var prop]}] (str var "." prop)) return)]
+                             bound prop-syms)
+        columns (mapv (fn [{:keys [var prop as agg star?]}]
+                        (or as
+                            (cond
+                              star? "count(*)"
+                              agg (str agg "(" var "." prop ")")
+                              :else (str var "." prop))))
+                      return)]
     {:coll-keys (into [] (distinct) (map :label nodes))
      :query {:find return-syms
              :where (-> []
@@ -634,21 +772,77 @@
                         (into where-clauses)
                         (into return-clauses))}
      :columns columns
+     ;; Aggregation is applied to result ROWS, like ordering and slicing: the
+     ;; bridge has no notion of grouping and inventing one there would mean
+     ;; reimplementing a planner this repo does not own. `:project` says, per
+     ;; output column, where its value comes from -- an index into the bound
+     ;; columns, or an aggregate over the group.
+     :project (let [idx (atom (dec (count entity-syms)))]
+                (mapv (fn [{:keys [agg star?]}]
+                        (if star?
+                          {:agg 'count :star? true}
+                          (let [i (swap! idx inc)]
+                            (if agg {:agg agg :index i} {:index i}))))
+                      return))
      ;; Ordering and slicing are applied to RESULT ROWS by `execute`, not
      ;; pushed into the Datalog query: the bridge's `:where` is a conjunction
      ;; of clauses with no notion of order or of a row window, and inventing
      ;; one there would mean reimplementing the parts of a query planner this
      ;; repo explicitly does not own.
      :distinct? (boolean distinct?)
-     :order-by (let [col->idx (into {} (map-indexed (fn [i c] [c i])) columns)]
+     ;; ORDER BY may name the alias or the underlying `var.prop`, because a
+     ;; query that renames a column still reads naturally ordering by either.
+     :order-by (let [col->idx (into {}
+                                    (comp (map-indexed
+                                           (fn [i {:keys [var prop as star? agg]}]
+                                             (cond-> [[(or as (cond star? "count(*)"
+                                                                    agg (str agg "(" var "." prop ")")
+                                                                    :else (str var "." prop)))
+                                                       i]]
+                                               (and as var prop (not agg))
+                                               (conj [(str var "." prop) i]))))
+                                          cat)
+                                    return)]
                  (mapv (fn [{:keys [var prop desc?]}]
-                         {:index (get col->idx (str var "." prop))
-                          :desc? (boolean desc?)})
+                         (let [k (str var "." prop)]
+                           (when-not (contains? col->idx k)
+                             (throw (semantic-err
+                                     (str "ORDER BY " k " is not in the RETURN list"))))
+                           {:index (get col->idx k) :desc? (boolean desc?)}))
                        order-by))
      :skip skip
      :limit limit}))
 
 ;; --------------------------------------------------------------- execute
+
+(defn- apply-project
+  "Map bound-column rows onto the projected output columns, aggregating when
+  any output column is an aggregate.
+
+  Grouping follows Cypher: the non-aggregate outputs are the group key. With no
+  aggregate this is a pure reordering.
+
+  **`count` counts the rows this engine produces, and datalog has SET
+  semantics** -- duplicate solutions never arrive here, so `count(*)` counts
+  DISTINCT solutions. Real Cypher counts a bag. Stated rather than discovered,
+  because the two agree on most queries and differ exactly where someone is
+  counting duplicates on purpose."
+  [project rows]
+  (if-not (seq project)
+    rows
+    (if-not (some :agg project)
+      (mapv (fn [row] (mapv #(nth row (:index %) nil) project)) rows)
+      (let [key-fn (fn [row] (mapv #(nth row (:index %) nil) (remove :agg project)))
+            groups (reduce (fn [m row] (update m (key-fn row) (fnil conj []) row)) {} rows)]
+        (mapv (fn [[k group]]
+                (let [ks (atom -1)]
+                  (mapv (fn [{:keys [agg index star?]}]
+                          (cond
+                            star? (count group)
+                            agg (count (remove nil? (map #(nth % index nil) group)))
+                            :else (nth k (swap! ks inc) nil)))
+                        project)))
+              groups)))))
 
 (defn- row-comparator
   " Comparator over result rows for `order-by` entries `{:index :desc?}`.
@@ -697,7 +891,7 @@
   what this function has always done: the bridge does not promise an order and
   an unstable result set is worse than an arbitrary but repeatable one."
   ([store translated visible?] (execute {} store translated visible?))
-  ([ctx store {:keys [coll-keys query distinct? order-by skip limit]} visible?]
+  ([ctx store {:keys [coll-keys query distinct? order-by skip limit project]} visible?]
   (let [;; The bridge yields each row as a SEQ, not a vector -- indexed access
         ;; is what ORDER BY needs and `nth` does not work on one. The old
         ;; stringified sort only ever used `mapv`, so this never showed until
@@ -707,6 +901,7 @@
         ;; caller with no ctx -- every existing one, including the tests --
         ;; keeps the behaviour it had.
         rows (mapv vec (bridge/q (bridge/db-for ctx store coll-keys) query visible?))
+        rows (apply-project project rows)
         rows (if distinct? (distinct rows) rows)
         rows (if (seq order-by)
                (sort (row-comparator order-by) rows)

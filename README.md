@@ -95,10 +95,23 @@ MATCH (n:Label) [WHERE n.prop <op> <value> [AND n.prop2 <op> <value2> ...]]
 - `WHERE` is a boolean expression: `=` `<` `>` `<=` `>=` `<>` combined with
   `AND`, `OR`, `NOT` and parentheses, at Cypher's precedence (OR looser than
   AND, AND looser than NOT) — no `IS NULL`/string functions/regex.
-- **`OR` and `NOT` accept only equalities**, and say so rather than guessing:
-  `arrangement.datalog`'s `or`/`not` branches are one clause each and bind
-  nothing, while a comparison needs two (bind, then constrain). A comparison
-  or a nested group inside `OR`/`NOT` is a named error. `=` puts the literal in
+- `OR` branches may be conjunctions (`arrangement.datalog` takes `(and ...)`
+  as a branch since kotoba-lang/arrangement#13), so a comparison, `IS NULL`, or
+  a parenthesised group inside `OR` all work.
+- **`NOT` negates the operator**, not the clause. Cypher is three-valued:
+  `NOT n.age > 18` on a node with no `age` does not match, and operator
+  negation keeps that while a datalog `not` would include those rows. `NOT`
+  over `CONTAINS` has no negated form and is a named error.
+- `IS NULL` / `IS NOT NULL` ask about **absence** — this store cannot hold the
+  difference between missing and null, and neither does Cypher.
+- `CONTAINS` maps onto the whitelisted `includes?`. No regex: a caller-supplied
+  pattern is a ReDoS vector.
+- **Multi-hop** patterns chain to any length; each hop gets its own foreign-key
+  variable.
+- `count(*)` / `count(n.prop)` group by the non-aggregate columns, and `AS`
+  renames any output. **`count` counts nodes** — the entity variables enter
+  `:find` when an aggregate is present, or datalog's set semantics would
+  collapse four users holding two roles into 2. `=` puts the literal in
   the triple so the index can probe it; a comparison binds and then constrains
   via an `arrangement.datalog` predicate clause.
 - `RETURN` projects one or more `var.prop` properties — never a bare node,
