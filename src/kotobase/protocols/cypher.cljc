@@ -41,7 +41,8 @@
 
   ```
   MATCH (n:Label) [WHERE n.prop = <value> [AND n.prop2 = <value2> ...]]
-    RETURN n.prop1 [, n.prop2 ...]
+    RETURN [DISTINCT] n.prop1 [, n.prop2 ...]
+    [ORDER BY n.propA [ASC|DESC] [, ...]] [SKIP n] [LIMIT n]
   ```
 
   - exactly one `MATCH` clause, one `RETURN` clause, at most one `WHERE`.
@@ -49,8 +50,12 @@
   - `WHERE` is equality-only (`=`), one or more clauses ANDed together --
     no `<`/`>`/`<>`/`OR`/`NOT`/`IS NULL`/string functions.
   - `RETURN` projects one or more `var.prop` properties -- never a bare
-    node/relationship, never `*`, never an alias (`AS`), never an
-    aggregate/`ORDER BY`/`LIMIT`/`SKIP`/`DISTINCT`.
+    node/relationship, never `*`, never an alias (`AS`), never an aggregate.
+  - `DISTINCT`, `ORDER BY` (per-item `ASC`/`DESC`), `SKIP` and `LIMIT` are
+    supported, applied to result ROWS in Cypher's clause order. `ORDER BY`
+    may only name a property `RETURN` projects -- ordering by an unreturned
+    one needs the sort key carried through the result set and dropped again,
+    so it is rejected by name rather than silently ignored.
   - values are string/number/boolean/`null`/`$parameter` literals only.
   - **no** `CREATE`/`MERGE`/`DELETE`/`SET`/`REMOVE`/`DETACH`/`FOREACH`/
     `CALL`/`UNWIND`/`LOAD CSV` -- this is a READ-ONLY query surface,
@@ -60,9 +65,10 @@
   - each of these is rejected with a clear parse-time error, never
     silently ignored or partially executed -- see `parse`.
 
-  Row order is NOT part of the v0.1 contract (no `ORDER BY`): `execute`
-  sorts rows by their stringified value for deterministic output across
-  runs, which is an implementation convenience, not a Cypher `ORDER BY`.
+  With no `ORDER BY`, `execute` still sorts rows by their stringified value
+  for deterministic output across runs -- the bridge promises no order, and
+  an unstable result set is worse than an arbitrary but repeatable one. That
+  is an implementation convenience; `ORDER BY` is the contract.
 
   ## Label -> collection mapping
 
@@ -329,7 +335,10 @@
     [{:var v :prop prop} toks]))
 
 (defn- parse-return [toks]
-  (let [toks (expect toks :return)]
+  (let [toks (expect toks :return)
+        distinct? (and (= :ident (peek-type toks))
+                       (= "DISTINCT" (str/upper-case (str (:val (first toks))))))
+        toks (if distinct? (rest toks) toks)]
     (when-not (= :ident (peek-type toks))
       (throw (syntax-err "RETURN must project at least one property (var.prop)")))
     (loop [toks toks items []]
@@ -337,7 +346,51 @@
             items (conj items item)]
         (if (= :comma (peek-type toks))
           (recur (rest toks) items)
-          [items toks])))))
+          [{:items items :distinct? distinct?} toks])))))
+
+
+;; ORDER BY / SKIP / LIMIT / DISTINCT are matched on the IDENTIFIER text rather
+;; than added to `keyword-tokens`, on purpose: a token type would make `order`,
+;; `skip` and `limit` unusable as PROPERTY names, so `RETURN n.limit` would stop
+;; parsing. Breaking a property name to add a clause keyword is a bad trade.
+
+(defn- kw-ident?
+  "True when the next token is the identifier `word`, case-insensitively."
+  [toks word]
+  (and (= :ident (peek-type toks))
+       (= word (str/upper-case (str (:val (first toks)))))))
+
+(defn- parse-order-by
+  "`ORDER BY item [ASC|DESC] [, ...]` -> `[[{:var :prop :desc?} ...] toks]`."
+  [toks]
+  (if-not (kw-ident? toks "ORDER")
+    [[] toks]
+    (let [toks (rest toks)]
+      (when-not (kw-ident? toks "BY")
+        (throw (syntax-err "expected BY after ORDER")))
+      (loop [toks (rest toks) items []]
+        (let [[{:keys [var prop]} toks] (parse-return-item toks)
+              desc? (kw-ident? toks "DESC")
+              toks (if (or desc? (kw-ident? toks "ASC")) (rest toks) toks)
+              items (conj items {:var var :prop prop :desc? desc?})]
+          (if (= :comma (peek-type toks))
+            (recur (rest toks) items)
+            [items toks]))))))
+
+(defn- parse-count
+  "`WORD n` -> `[n toks]` for SKIP/LIMIT. A negative or fractional count is
+  rejected at parse time rather than left for `drop`/`take` to reinterpret."
+  [toks word]
+  (if-not (kw-ident? toks word)
+    [nil toks]
+    (let [toks (rest toks)
+          t (first toks)]
+      (when-not (= :number (:type t))
+        (throw (syntax-err (str word " expects a number, got " (describe-tok t)))))
+      (let [v (:val t)]
+        (when-not (and (integer? v) (not (neg? v)))
+          (throw (syntax-err (str word " expects a non-negative integer, got " v))))
+        [v (rest toks)]))))
 
 (defn parse
   "Parse one Cypher v0.1 statement string into an AST map:
@@ -355,7 +408,10 @@
         toks (expect-match toks)
         [pattern toks] (parse-pattern toks)
         [wpreds toks] (parse-where toks)
-        [ritems toks] (parse-return toks)]
+        [{ritems :items distinct? :distinct?} toks] (parse-return toks)
+        [order-items toks] (parse-order-by toks)
+        [skip toks] (parse-count toks "SKIP")
+        [limit toks] (parse-count toks "LIMIT")]
     (when (seq toks)
       (throw (syntax-err (str "unexpected trailing input starting at " (describe-tok (first toks))))))
     (when (empty? ritems)
@@ -367,8 +423,20 @@
                                 (str "unknown variable '" v "' in " where-desc
                                      " -- not declared in the MATCH pattern")))))]
       (doseq [p wpreds] (check-var (:var p) "WHERE"))
-      (doseq [r ritems] (check-var (:var r) "RETURN")))
-    {:pattern pattern :where wpreds :return ritems}))
+      (doseq [r ritems] (check-var (:var r) "RETURN"))
+      (doseq [o order-items] (check-var (:var o) "ORDER BY")))
+    ;; ORDER BY may only name something RETURN projects. Cypher itself allows
+    ;; ordering by an unreturned expression, but that needs the sort key in the
+    ;; result set and then dropped again -- a real feature, not a parse tweak.
+    ;; Rejected explicitly rather than silently ignored.
+    (let [returned (into #{} (map (juxt :var :prop)) ritems)]
+      (doseq [{:keys [var prop]} order-items]
+        (when-not (contains? returned [var prop])
+          (throw (semantic-err
+                  (str "ORDER BY " var "." prop " is not in the RETURN list --"
+                       " ordering by an unreturned property is not supported yet"))))))
+    {:pattern pattern :where wpreds :return ritems
+     :distinct? distinct? :order-by order-items :skip skip :limit limit}))
 
 ;; ------------------------------------------------------------ translate
 
@@ -394,7 +462,7 @@
   `kotobase.query.bridge`-shaped query descriptor:
   `{:coll-keys [...] :query {:find [...] :where [...]} :columns [...]}`,
   `:columns` in `:find`/row order (`\"n.prop\"` strings, Neo4j-style)."
-  [{:keys [pattern where return]} parameters]
+  [{:keys [pattern where return distinct? order-by skip limit]} parameters]
   (let [nodes (:nodes pattern)
         rel-type (:rel-type pattern)
         node-clauses (mapv (fn [{:keys [var label]}] [(var-sym var) :kotobase/coll label]) nodes)
@@ -418,19 +486,77 @@
                         (into rel-clauses)
                         (into where-clauses)
                         (into return-clauses))}
-     :columns columns}))
+     :columns columns
+     ;; Ordering and slicing are applied to RESULT ROWS by `execute`, not
+     ;; pushed into the Datalog query: the bridge's `:where` is a conjunction
+     ;; of clauses with no notion of order or of a row window, and inventing
+     ;; one there would mean reimplementing the parts of a query planner this
+     ;; repo explicitly does not own.
+     :distinct? (boolean distinct?)
+     :order-by (let [col->idx (into {} (map-indexed (fn [i c] [c i])) columns)]
+                 (mapv (fn [{:keys [var prop desc?]}]
+                         {:index (get col->idx (str var "." prop))
+                          :desc? (boolean desc?)})
+                       order-by))
+     :skip skip
+     :limit limit}))
 
 ;; --------------------------------------------------------------- execute
 
+(defn- row-comparator
+  " Comparator over result rows for `order-by` entries `{:index :desc?}`.
+
+  Written out rather than `sort-by` + `juxt` because that form can only sort
+  every key the same direction, and `ORDER BY a, b DESC` needs two. Values are
+  compared inside a type and across types by type name, with nil first, so a
+  heterogeneous column orders rather than throwing -- a result set binds
+  whatever the documents hold and does not promise homogeneity."
+  [order-by]
+  (fn [x y]
+    (loop [os (seq order-by)]
+      (if-not os
+        0
+        (let [{:keys [index desc?]} (first os)
+              a (nth x index nil) b (nth y index nil)
+              c (cond
+                  (and (nil? a) (nil? b)) 0
+                  (nil? a) -1
+                  (nil? b) 1
+                  (= (type a) (type b))
+                  (try (compare a b)
+                       (catch #?(:clj Exception :cljs :default) _
+                         (compare (str a) (str b))))
+                  :else (compare (str (type a)) (str (type b))))
+              c (if desc? (- c) c)]
+          (if (zero? c) (recur (next os)) c))))))
+
 (defn execute
-  "Run a `translate`d query descriptor `{:coll-keys :query}` against
-  `store` via `kotobase.query.bridge/query` (materialize + q), filtered by
-  the REQUIRED `visible?` predicate. Returns a vector of result rows
-  (vectors, `:find`/`:columns` order) sorted by stringified value for
-  deterministic output -- v0.1 has no ORDER BY, see ns docstring."
-  [store {:keys [coll-keys query]} visible?]
-  (let [rows (bridge/query store coll-keys query visible?)]
-    (vec (sort-by (fn [row] (mapv str row)) rows))))
+  " Run a `translate`d query descriptor against `store` via
+  `kotobase.query.bridge/query` (materialize + q), filtered by the REQUIRED
+  `visible?` predicate. Returns a vector of result rows in `:columns` order.
+
+  DISTINCT, ORDER BY, SKIP and LIMIT are applied here, in Cypher's own clause
+  order (distinct, then order, then skip, then limit) -- getting that order
+  wrong changes answers, e.g. LIMIT before DISTINCT returns fewer rows than
+  asked for.
+
+  With no ORDER BY the rows are still sorted by stringified value, which is
+  what this function has always done: the bridge does not promise an order and
+  an unstable result set is worse than an arbitrary but repeatable one."
+  [store {:keys [coll-keys query distinct? order-by skip limit]} visible?]
+  (let [;; The bridge yields each row as a SEQ, not a vector -- indexed access
+        ;; is what ORDER BY needs and `nth` does not work on one. The old
+        ;; stringified sort only ever used `mapv`, so this never showed until
+        ;; there was a comparator that reads a column by position.
+        rows (mapv vec (bridge/query store coll-keys query visible?))
+        rows (if distinct? (distinct rows) rows)
+        rows (if (seq order-by)
+               (sort (row-comparator order-by) rows)
+               (sort-by (fn [row] (mapv str row)) rows))
+        rows (cond->> rows
+               (and skip (pos? skip)) (drop skip)
+               limit (take limit))]
+    (vec rows)))
 
 ;; ----------------------------------------------------------------- HTTP
 
