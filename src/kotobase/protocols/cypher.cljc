@@ -591,12 +591,17 @@
   With no ORDER BY the rows are still sorted by stringified value, which is
   what this function has always done: the bridge does not promise an order and
   an unstable result set is worse than an arbitrary but repeatable one."
-  [store {:keys [coll-keys query distinct? order-by skip limit]} visible?]
+  ([store translated visible?] (execute {} store translated visible?))
+  ([ctx store {:keys [coll-keys query distinct? order-by skip limit]} visible?]
   (let [;; The bridge yields each row as a SEQ, not a vector -- indexed access
         ;; is what ORDER BY needs and `nth` does not work on one. The old
         ;; stringified sort only ever used `mapv`, so this never showed until
         ;; there was a comparator that reads a column by position.
-        rows (mapv vec (bridge/query store coll-keys query visible?))
+        ;; db-for memoises when ctx carries a content address, and builds fresh
+        ;; when it does not (ADR-2607310900 L1). The 3-arity passes `{}`, so a
+        ;; caller with no ctx -- every existing one, including the tests --
+        ;; keeps the behaviour it had.
+        rows (mapv vec (bridge/q (bridge/db-for ctx store coll-keys) query visible?))
         rows (if distinct? (distinct rows) rows)
         rows (if (seq order-by)
                (sort (row-comparator order-by) rows)
@@ -604,7 +609,7 @@
         rows (cond->> rows
                (and skip (pos? skip)) (drop skip)
                limit (take limit))]
-    (vec rows)))
+    (vec rows))))
 
 ;; ----------------------------------------------------------------- HTTP
 
@@ -620,7 +625,7 @@
   {...}}` map. Returns `{:ok true :result {...}}` or `{:ok false :error
   {...}}` -- never throws (all failures inside the Cypher pipeline are
   caught here and turned into the response's `errors` shape)."
-  [store visible? now stmt]
+  [ctx store visible? now stmt]
   (let [statement (get stmt "statement")
         parameters (or (get stmt "parameters") {})]
     (try
@@ -628,7 +633,7 @@
         (throw (param-err "each statement must have a string \"statement\" field"))
         (let [ast (parse statement)
               translated (translate ast parameters)
-              rows (execute store translated visible?)]
+              rows (execute ctx store translated visible?)]
           (audit! store :query statement now {:row-count (count rows)})
           {:ok true
            :result {"columns" (:columns translated)
@@ -650,7 +655,7 @@
 
   `:visible?` is REQUIRED -- throws immediately (a ctx bug, not a wire
   error) if missing; no permissive default (ADR-2607050500)."
-  [{:keys [store visible? now]} req]
+  [{:keys [store visible? now] :as ctx} req]
   (when-not (fn? visible?)
     (throw (ex-info
             (str "kotobase.protocols.cypher/handle requires ctx :visible? -- a REQUIRED"
@@ -682,7 +687,7 @@
         (loop [stmts (get parsed "statements") results []]
           (if (empty? stmts)
             (json-response 200 {"results" results "errors" []})
-            (let [{:keys [ok result error]} (run-statement store visible? now (first stmts))]
+            (let [{:keys [ok result error]} (run-statement ctx store visible? now (first stmts))]
               (if ok
                 (recur (rest stmts) (conj results result))
                 ;; A statement error aborts the whole transaction, matching
