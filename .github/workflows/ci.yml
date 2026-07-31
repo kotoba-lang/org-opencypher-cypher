@@ -13,7 +13,7 @@ jobs:
         with:
           repository: kotoba-lang/kotobase-query
           # Same pin as deps.edn — keep the two in lockstep.
-          ref: a188a5e3607acb797937da5a8fb83ff7969bca3e
+          ref: be8ba52b5e6581bb0489f35480ebea925c9fb478
           path: .deps/kotobase-query
       - uses: actions/checkout@v4
         with:
@@ -25,7 +25,7 @@ jobs:
         with:
           repository: kotoba-lang/arrangement
           # Same pin as kotobase-query's own deps.edn (transitive).
-          ref: 591ade4db1b324fc4ec83de932888b141bd69e09
+          ref: 9e90426430bb4eb6206112a74465a4f9d62fe0c8
           path: .deps/arrangement
       - uses: actions/checkout@v4
         with:
@@ -37,7 +37,7 @@ jobs:
         with:
           repository: kotoba-lang/io-ipld
           # Same pin as arrangement's own deps.edn (transitive).
-          ref: 4591764514239c4777f227a7a56d46c901e2a4a0
+          ref: e08dc3b2ab705be292e388cd1ad136381544a041
           path: .deps/io-ipld
       - uses: actions/checkout@v4
         with:

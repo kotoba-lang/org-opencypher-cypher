@@ -59,7 +59,7 @@
 (deftest parse-relationship-pattern
   (let [ast (cypher/parse "MATCH (u:users)-[:WORKS_AT]->(d:departments) RETURN u.name, d.name")]
     (is (= ["u" "d"] (map :var (:nodes (:pattern ast)))))
-    (is (= "WORKS_AT" (:rel-type (:pattern ast))))))
+    (is (= ["WORKS_AT"] (:rels (:pattern ast))))))
 
 (deftest parse-parameter-value
   (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = $role RETURN n.name")]
@@ -83,10 +83,17 @@
                         #"variable-length"
                         (cypher/parse "MATCH (a:users)-[:KNOWS*1..3]->(b:users) RETURN a.name"))))
 
-(deftest reject-multi-hop-pattern
-  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
-                        #"multi-hop"
-                        (cypher/parse "MATCH (a:users)-[:KNOWS]->(b:users)-[:KNOWS]->(c:users) RETURN a.name"))))
+(deftest multi-hop-patterns-chain
+  ;; This used to assert multi-hop was REFUSED. `:rels` has one fewer entry than
+  ;; `:nodes`, so hop i joins node i to node i+1 and a pattern is a chain of any
+  ;; length rather than a special case for two.
+  (let [ast (cypher/parse "MATCH (a:users)-[:KNOWS]->(b:users)-[:WORKS_AT]->(c:departments) RETURN a.name")]
+    (is (= ["a" "b" "c"] (map :var (:nodes (:pattern ast)))))
+    (is (= ["KNOWS" "WORKS_AT"] (:rels (:pattern ast)))))
+  (testing "each hop gets its own foreign-key lvar, so a chain cannot collide with itself"
+    (let [t (cypher/translate (cypher/parse "MATCH (a:users)-[:KNOWS]->(b:users)-[:KNOWS]->(c:users) RETURN a.name") {})
+          fks (distinct (filter #(and (symbol? %) (re-find #"__fk" (name %))) (flatten (:where (:query t)))))]
+      (is (= 2 (count fks)) (pr-str fks)))))
 
 (deftest reject-undirected-and-reverse-relationships
   (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
@@ -403,29 +410,123 @@
     (is (= :and (:kind e)))
     (is (= :or (:kind (first (:args e)))))))
 
-(deftest or-and-not-translate-to-datalog-special-forms
+(deftest or-becomes-a-datalog-or-and-not-becomes-operator-negation
   (let [t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'a' OR n.role = 'b' RETURN n.name") {})
-        ors (filter #(and (seq? %) (= 'or (first %))) (:where (:query t)))
-        t2 (cypher/translate (cypher/parse "MATCH (n:users) WHERE NOT n.role = 'a' RETURN n.name") {})
-        nots (filter #(and (seq? %) (= 'not (first %))) (:where (:query t2)))]
+        ors (filter #(and (seq? %) (= 'or (first %))) (:where (:query t)))]
     (is (= 1 (count ors)))
-    (is (= 2 (count (rest (first ors)))) "one branch per alternative")
-    (is (= 1 (count nots)))))
+    (is (= 2 (count (rest (first ors)))) "one branch per alternative"))
+  (testing "NOT does NOT become a datalog `not` clause — it is pushed to the
+            leaves and negates the operator, because Cypher's logic is
+            three-valued: `NOT n.role = 'a'` on a node with no role is NOT NULL,
+            which is NULL, which does not match. A `(not [e a v])` would INCLUDE
+            those rows, which is a different query"
+    (let [t (cypher/translate (cypher/parse "MATCH (n:users) WHERE NOT n.role = 'a' RETURN n.name") {})
+          ws (:where (:query t))
+          nots (filter #(and (seq? %) (= 'not (first %))) ws)
+          preds (filter #(seq? (first %)) ws)]
+      (is (empty? nots))
+      (is (= 1 (count preds)))
+      (is (= 'not= (first (first (first preds))))))))
 
-(deftest a-comparison-inside-or-or-not-is-refused-by-name
-  (testing "datalog's `or`/`not` branches are ONE clause and bind nothing, and
-            a comparison needs two — bind the property, then constrain the
-            binding. Rejected with the reason rather than mistranslated into
-            something that returns the wrong rows"
-    (doseq [q ["MATCH (n:users) WHERE n.age > 18 OR n.role = 'a' RETURN n.name"
-               "MATCH (n:users) WHERE NOT n.age > 18 RETURN n.name"]]
-      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
-                            #"single clause"
-                            (cypher/parse-and-translate-probe q))
-          q))))
+(deftest not-over-an-unnegatable-predicate-is-refused-by-name
+  (testing "CONTAINS has no negated form in the whitelist, and guessing one
+            would change which rows come back"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"no negated form"
+                          (cypher/parse-and-translate-probe
+                           "MATCH (n:users) WHERE NOT n.name CONTAINS 'x' RETURN n.name")))))
 
-(deftest a-nested-group-inside-or-is-refused-by-name
-  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
-                        #"single comparison or its"
-                        (cypher/parse-and-translate-probe
-                         "MATCH (n:users) WHERE n.role = 'a' OR (n.role = 'b' AND n.works_at = 'd1') RETURN n.name"))))
+(deftest comparisons-inside-or-and-not-now-work
+  ;; These used to assert a REFUSAL: a datalog or/not branch was one clause and
+  ;; bound nothing, so a comparison could not be a branch. The `(and ...)`
+  ;; branch form landed in kotoba-lang/arrangement#13, so the refusal is
+  ;; DELETED rather than relaxed.
+  (let [s (numeric-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"]]
+           (run "MATCH (n:people) WHERE n.age > 18 OR n.age < 18 RETURN n.name")))
+    (is (= [["Carol"]]
+           (run "MATCH (n:people) WHERE n.age > 40 OR n.name = 'zzz' RETURN n.name")))
+    (is (= [["Bob"]]
+           (run "MATCH (n:people) WHERE NOT n.age > 18 RETURN n.name")))))
+
+(deftest a-nested-group-inside-or-now-works
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"]]
+           (run "MATCH (n:users) WHERE n.role = 'admin' OR (n.role = 'user' AND n.works_at = 'd2') RETURN n.name")))))
+
+(deftest a-comparison-branch-becomes-an-and-clause
+  (testing "the branch is a conjunction: bind the property, then constrain it"
+    (let [t (cypher/translate (cypher/parse "MATCH (n:people) WHERE n.age > 18 OR n.name = 'x' RETURN n.name") {})
+          or-clause (first (filter #(and (seq? %) (= 'or (first %))) (:where (:query t))))
+          branches (rest or-clause)]
+      (is (= 2 (count branches)))
+      (is (= 'and (first (first branches))) "the comparison branch is an (and ...)")
+      (is (= 2 (count (rest (first branches)))) "bind + constrain"))))
+
+;; --- IS NULL / CONTAINS / multi-hop ----------------------------------------
+
+(deftest is-null-asks-about-absence
+  (testing "Dave has no :works_at. Cypher does not distinguish a missing
+            property from a null one and neither can this store — doc->datoms
+            emits no datom for a nil"
+    (let [s (fixture-store)
+          run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+      (is (= [["Dave"]] (run "MATCH (n:users) WHERE n.works_at IS NULL RETURN n.name")))
+      (is (= [["Alice"] ["Bob"] ["Carol"]]
+             (run "MATCH (n:users) WHERE n.works_at IS NOT NULL RETURN n.name"))))))
+
+(deftest contains-maps-onto-the-whitelisted-string-predicate
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Carol"]] (run "MATCH (n:users) WHERE n.name CONTAINS 'l' RETURN n.name")))
+    (is (= [["Bob"]] (run "MATCH (n:users) WHERE n.name CONTAINS 'ob' RETURN n.name")))))
+
+(deftest multi-hop-runs-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Engineering"]]
+           (run "MATCH (u:users)-[:WORKS_AT]->(d:departments) WHERE u.name = 'Alice' RETURN d.name")))))
+
+(deftest is-null-inside-or-is-a-branch-too
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Carol"] ["Dave"]]
+           (run "MATCH (n:users) WHERE n.works_at IS NULL OR n.role = 'admin' RETURN n.name")))))
+
+;; --- AS aliases and count() ------------------------------------------------
+
+(deftest alias-and-aggregate-columns
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.name AS who") {})]
+    (is (= ["who"] (:columns t))))
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.role, count(*)") {})]
+    (is (= ["n.role" "count(*)"] (:columns t))))
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.role, count(*) AS total") {})]
+    (is (= ["n.role" "total"] (:columns t)))))
+
+(deftest count-groups-by-the-non-aggregate-columns
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["admin" 2] ["user" 2]]
+           (run "MATCH (n:users) RETURN n.role, count(*) AS total ORDER BY n.role")))
+    (is (= [[4]] (run "MATCH (n:users) RETURN count(*)"))
+        "no grouping column means one group")))
+
+(deftest count-of-a-property-skips-the-rows-missing-it
+  (testing "Dave has no :works_at, so count(n.works_at) is 3 while count(*) is 4"
+    (let [s (fixture-store)
+          run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+      (is (= [[4]] (run "MATCH (n:users) RETURN count(*)")))
+      (is (= [[3]] (run "MATCH (n:users) RETURN count(n.works_at)")))
+      (testing "the entity vars in :find are what make these counts per-NODE.
+                Four users hold only two distinct roles; datalog has set
+                semantics, so without the entity bound this would collapse to 2"
+        (is (= [[4]] (run "MATCH (n:users) RETURN count(n.role)"))
+            "four users, two distinct roles — counting nodes, not values")))))
+
+(deftest aliases-run-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"] ["Dave"]]
+           (run "MATCH (n:users) RETURN n.name AS who ORDER BY n.name")))))
