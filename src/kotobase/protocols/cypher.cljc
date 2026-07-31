@@ -191,6 +191,39 @@
 
 ;; ------------------------------------------------------------- tokenize
 
+(defn- tokenize-backticked
+  "`s`, index `i` at the opening backtick -> `[identifier-name
+  index-after-closing-backtick]`.
+
+  openCypher quotes an identifier in backticks when it is not a bare
+  `[A-Za-z_][A-Za-z0-9_]*` word, and that is not a nicety here: this surface
+  names a `kotobase.store` collection with a label, and the collections it is
+  actually deployed beside are `[:kotobase.s3/objects bucket]` and
+  `[:kotobase.at/records did nsid]`. Their addressable leaf names are bucket
+  names (`my-bucket`) and nsids (`app.bsky.feed.post`) -- a hyphen scans as
+  `:dash` and a dot as `:dot`, so without this both are unsayable and the
+  collection is invisible rather than merely awkward to reach.
+
+  A literal backtick inside is written doubled, as openCypher specifies.
+  Unterminated and empty are errors: an empty identifier would name nothing
+  and silently match nothing."
+  [s i]
+  (let [n (count s)]
+    (loop [j (inc i) acc ""]
+      (cond
+        (>= j n)
+        (throw (syntax-err (str "unterminated backtick-quoted identifier "
+                                "starting at position " i)))
+
+        (= "`" (subs s j (inc j)))
+        (if (= "`" (subs s (inc j) (min n (+ j 2))))
+          (recur (+ j 2) (str acc "`"))
+          (if (empty? acc)
+            (throw (syntax-err (str "empty backtick-quoted identifier at position " i)))
+            [acc (inc j)]))
+
+        :else (recur (inc j) (str acc (subs s j (inc j))))))))
+
 (defn- tokenize-string
   "`s`, index `i` at the opening quote char `quote` -> `[unescaped-value
   index-after-closing-quote]`."
@@ -257,6 +290,12 @@
               (if m
                 (recur (+ i 1 (count m)) (conj toks {:type :param :val m}))
                 (throw (syntax-err (str "expected an identifier after '$' at position " i)))))
+            ;; A backticked identifier is deliberately NOT looked up in
+            ;; keyword-tokens: quoting is what escapes keyword-ness, so
+            ;; `count` is a property named count and not the COUNT token.
+            (= c "`")
+            (let [[v i'] (tokenize-backticked s i)]
+              (recur i' (conj toks {:type :ident :val v})))
             (or (= c "'") (= c "\""))
             (let [[v i'] (tokenize-string s i c)]
               (recur i' (conj toks {:type :string :val v})))

@@ -603,3 +603,59 @@
         t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name") {})]
     (is (= (cypher/execute s t everything)
            (cypher/execute {:coll-keys ["users" "departments"]} s t everything)))))
+
+;; --- backtick-quoted identifiers -------------------------------------------
+;; The collections this surface is deployed beside are keyed
+;; [:kotobase.s3/objects bucket] and [:kotobase.at/records did nsid]. Resolving
+;; a label to them (above) is necessary and was not sufficient: their leaf
+;; names are bucket names and nsids, and a hyphen scans as :dash and a dot as
+;; :dot, so "my-bucket" and "app.bsky.feed.post" could not be written at all.
+
+(defn- nsid-store []
+  (let [s (local/local-store)]
+    (st/-put s [:kotobase.at/records "did:x" "app.bsky.feed.post"] "p1"
+             {:text "hello" :lang "en"})
+    (st/-put s [:kotobase.at/records "did:x" "app.bsky.feed.post"] "p2"
+             {:text "bonjour" :lang "fr"})
+    s))
+
+(deftest a-dotted-label-parses-when-quoted
+  (is (= [{:var "n" :label "app.bsky.feed.post"}]
+         (:nodes (:pattern (cypher/parse "MATCH (n:`app.bsky.feed.post`) RETURN n.text"))))))
+
+(deftest a-hyphenated-label-parses-when-quoted
+  (is (= [{:var "n" :label "my-bucket"}]
+         (:nodes (:pattern (cypher/parse "MATCH (n:`my-bucket`) RETURN n.k"))))))
+
+(deftest the-same-label-unquoted-is-still-a-syntax-error
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (cypher/parse "MATCH (n:my-bucket) RETURN n.k"))))
+
+(deftest quoting-escapes-keyword-ness
+  ;; `count` is a property named count, not the COUNT token -- otherwise a
+  ;; document with a "count" field would be unreadable.
+  (is (= ["n.count"] (:columns (cypher/translate
+                                (cypher/parse "MATCH (n:users) RETURN n.`count`")
+                                {})))))
+
+(deftest a-doubled-backtick-is-a-literal-one
+  (is (= [{:var "n" :label "we`ird"}]
+         (:nodes (:pattern (cypher/parse "MATCH (n:`we``ird`) RETURN n.k"))))))
+
+(deftest unterminated-and-empty-backticks-are-errors
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (cypher/parse "MATCH (n:`unclosed) RETURN n.k")))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (cypher/parse "MATCH (n:``) RETURN n.k"))))
+
+(deftest an-nsid-collection-is-queryable-end-to-end
+  ;; The whole point: this is what atproto putRecord writes, and before this
+  ;; there was no way to write the query at all.
+  (let [s (nsid-store)
+        t (cypher/translate
+           (cypher/parse (str "MATCH (n:`app.bsky.feed.post`) WHERE n.lang = 'en' "
+                              "RETURN n.text"))
+           {})]
+    (is (= [["hello"]]
+           (cypher/execute {:coll-keys [[:kotobase.at/records "did:x" "app.bsky.feed.post"]]}
+                           s t everything)))))
