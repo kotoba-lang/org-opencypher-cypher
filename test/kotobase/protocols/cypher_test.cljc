@@ -109,9 +109,12 @@
                         (cypher/parse "MATCH (n:users) RETURN"))))
 
 (deftest reject-trailing-garbage
+  ;; This used to use "... RETURN n.name ORDER BY n.name" as the garbage, which
+  ;; pinned ORDER BY's absence as the contract. ORDER BY parses now, so the test
+  ;; needs input that is actually trailing garbage.
   (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                         #"unexpected trailing"
-                        (cypher/parse "MATCH (n:users) RETURN n.name ORDER BY n.name"))))
+                        (cypher/parse "MATCH (n:users) RETURN n.name FOO BAR"))))
 
 ;; --------------------------------------------------------- end-to-end
 
@@ -250,3 +253,59 @@
       (is (= "MATCH (n:users) RETURN n.name" (:statement (first events))))
       (is (= 4 (:row-count (first events))))
       (is (string? (:error (second events)))))))
+
+;; --- ORDER BY / SKIP / LIMIT / DISTINCT ------------------------------------
+
+(deftest order-by-skip-limit-distinct-parse
+  (let [ast (cypher/parse
+             "MATCH (n:users) RETURN DISTINCT n.name, n.role ORDER BY n.role DESC, n.name SKIP 1 LIMIT 2")]
+    (is (true? (:distinct? ast)))
+    (is (= [{:var "n" :prop "role" :desc? true}
+            {:var "n" :prop "name" :desc? false}]
+           (:order-by ast)))
+    (is (= 1 (:skip ast)))
+    (is (= 2 (:limit ast)))))
+
+(deftest plain-return-keeps-its-old-shape
+  (testing "no new clause means no behaviour change for existing callers"
+    (let [ast (cypher/parse "MATCH (n:users) RETURN n.name")]
+      (is (false? (:distinct? ast)))
+      (is (empty? (:order-by ast)))
+      (is (nil? (:skip ast)))
+      (is (nil? (:limit ast))))))
+
+(deftest order-by-must-name-something-returned
+  (testing "Cypher allows ordering by an unreturned expression; that needs the
+            sort key carried through the result set and dropped again, so it is
+            rejected by name rather than silently ignored"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"not in the RETURN list"
+                          (cypher/parse "MATCH (n:users) RETURN n.name ORDER BY n.role")))))
+
+(deftest skip-and-limit-reject-nonsense-counts
+  (doseq [q ["MATCH (n:users) RETURN n.name LIMIT -1"
+             "MATCH (n:users) RETURN n.name LIMIT 1.5"
+             "MATCH (n:users) RETURN n.name LIMIT n"]]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cypher/parse q)) q)))
+
+(deftest clause-keywords-are-still-usable-as-property-names
+  (testing "matched on identifier text rather than tokenized, so a document
+            with an `order` or `limit` property stays queryable"
+    (doseq [prop ["order" "skip" "limit" "distinct" "by" "asc" "desc"]]
+      (let [ast (cypher/parse (str "MATCH (n:users) RETURN n." prop))]
+        (is (= [{:var "n" :prop prop}] (:return ast)) prop)))))
+
+(deftest order-by-and-limit-run-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (testing "descending, and the whole point: it is not the ascending order"
+      (is (= [["Dave"] ["Carol"] ["Bob"] ["Alice"]]
+             (run "MATCH (n:users) RETURN n.name ORDER BY n.name DESC")))
+      (is (= [["Alice"] ["Bob"] ["Carol"] ["Dave"]]
+             (run "MATCH (n:users) RETURN n.name ORDER BY n.name"))))
+    (testing "SKIP then LIMIT, applied in Cypher's clause order"
+      (is (= [["Bob"] ["Carol"]]
+             (run "MATCH (n:users) RETURN n.name ORDER BY n.name SKIP 1 LIMIT 2"))))
+    (testing "DISTINCT collapses before LIMIT, so LIMIT still returns what was asked"
+      (is (= [["admin"] ["user"]]
+             (run "MATCH (n:users) RETURN DISTINCT n.role ORDER BY n.role"))))))

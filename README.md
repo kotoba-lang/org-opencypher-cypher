@@ -85,7 +85,8 @@ namespace.
 
 ```
 MATCH (n:Label) [WHERE n.prop = <value> [AND n.prop2 = <value2> ...]]
-  RETURN n.prop1 [, n.prop2 ...]
+  RETURN [DISTINCT] n.prop1 [, n.prop2 ...]
+  [ORDER BY n.propA [ASC|DESC] [, ...]] [SKIP n] [LIMIT n]
 ```
 
 - exactly one `MATCH`, one `RETURN`, at most one `WHERE`.
@@ -93,8 +94,11 @@ MATCH (n:Label) [WHERE n.prop = <value> [AND n.prop2 = <value2> ...]]
 - `WHERE` is **equality only** (`=`), one or more clauses **AND**ed — no
   `<`/`>`/`<>`/`OR`/`NOT`/`IS NULL`/string functions/regex.
 - `RETURN` projects one or more `var.prop` properties — never a bare node,
-  never `*`, never `AS` aliasing, never an aggregate, `ORDER BY`, `LIMIT`,
-  `SKIP`, or `DISTINCT`.
+  never `*`, never `AS` aliasing, never an aggregate.
+- `DISTINCT`, `ORDER BY` (per-item `ASC`/`DESC`), `SKIP` and `LIMIT` are
+  supported, applied to result rows in Cypher's clause order — so `DISTINCT`
+  collapses before `LIMIT` counts, which is the order that changes answers.
+  `ORDER BY` may only name a property `RETURN` projects.
 - values: string / number / boolean / `null` / `$parameter` literals only.
 - **read-only**: `CREATE`/`MERGE`/`DELETE`/`SET`/`REMOVE`/`DETACH`/
   `FOREACH`/`CALL`/`UNWIND`/`LOAD CSV` are all **explicitly rejected** with
@@ -103,10 +107,9 @@ MATCH (n:Label) [WHERE n.prop = <value> [AND n.prop2 = <value2> ...]]
 - **no** variable-length paths (`-[:REL*1..3]->`), **no** multi-hop chains
   (more than one relationship per pattern).
 
-Row order is not part of the contract (no `ORDER BY` in v0.1) — the
-implementation sorts rows by their stringified value for deterministic
-output across runs; this is an implementation convenience, not Cypher
-`ORDER BY` semantics.
+With no `ORDER BY`, rows are sorted by their stringified value for
+deterministic output across runs — an implementation convenience, since the
+bridge promises no order. `ORDER BY` is the contract.
 
 ### Label → collection mapping
 
