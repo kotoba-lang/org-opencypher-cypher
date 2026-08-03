@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [kotobase.local :as local]
             [kotobase.protocols.cypher :as cypher]
-            [kotobase.protocols.json :as json]
+            [kotobase.protocols.cypher.json :as json]
             [kotobase.store :as st]))
 
 (def everything (constantly true))
