@@ -6,7 +6,7 @@
   **Why HTTP, not Bolt**: Bolt is binary, stateful, and has no precedent in
   this workspace; the HTTP transaction-endpoint shape (Neo4j's HTTP Cypher
   API) fits the established `.cljc` ring-shaped handler pattern
-  (`kotobase.protocols.http`) directly, and is the ADR's explicit,
+  (`kotobase.protocols.cypher.http`) directly, and is the ADR's explicit,
   deliberate v0.1 decision -- not revisited here.
 
   ## Wire shape: `POST /db/data/transaction/commit`
@@ -170,8 +170,8 @@
   avoids leaking materialized property values or parameter payloads into
   the audit trail."
   (:require [clojure.string :as str]
-            [kotobase.protocols.http :as http]
-            [kotobase.protocols.json :as json]
+            [kotobase.protocols.cypher.http :as http]
+            [kotobase.protocols.cypher.json :as json]
             [kotobase.query.bridge :as bridge]
             [kotobase.store :as st]))
 

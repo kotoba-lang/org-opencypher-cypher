@@ -1,9 +1,9 @@
-(ns kotobase.protocols.json
+(ns kotobase.protocols.cypher.json
   "Minimal, dependency-free JSON encode/parse in portable cljc.
 
-  VENDORED, not a dependency: copied verbatim from `kotobase-protocols`'
-  `kotobase.protocols.json` (same namespace name, deliberately — see
-  `kotobase.protocols.http`'s docstring for why: ADR-2607172300's
+  VENDORED, not a dependency: copied from `kotobase-protocols`'
+  `kotobase.protocols.json`, and namespaced under `cypher` here for the
+  reason `kotobase.protocols.cypher.http`'s docstring gives: ADR-2607172300's
   dependency table lists only `kotoba-lang/kotobase-query` as this repo's
   dependency, so a whole extra git dependency on `kotobase-protocols`
   isn't pulled in just for this one zero-dependency file). Exists so the
