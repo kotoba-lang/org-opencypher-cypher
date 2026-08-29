@@ -1,8 +1,6 @@
 {
   "name": "org-opencypher-cypher",
   "private": true,
-  "description": "org-opencypher-cypher -- transitive npm dep of kotoba-lang/arrangement (via kotobase-query), needed to load arrangement.core under nbb (multiformats.core's @noble/hashes/sha2.js use). Mirrors kotobase-query's package.json exactly -- see that repo's comment for why io-multiformats' own vestigial \"hashes\" package.json entry is deliberately NOT mirrored here.",
-  "dependencies": {
-    "@noble/hashes": "^1.4.0"
-  }
+  "description": "org-opencypher-cypher — noble-free via org-nist-sha2 (ADR-2608260200 tranche 2).",
+  "dependencies": {}
 }
