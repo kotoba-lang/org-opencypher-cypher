@@ -11,49 +11,76 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: kotoba-lang/kotobase-query
-          # Same pin as deps.edn — keep the two in lockstep.
-          ref: be8ba52b5e6581bb0489f35480ebea925c9fb478
-          path: .deps/kotobase-query
-      - uses: actions/checkout@v4
-        with:
           repository: kotoba-lang/kotobase
-          # Same pin as kotobase-query's own deps.edn (transitive).
           ref: bbf57df9dde5c1869182012860129a598382e088
           path: .deps/kotobase
       - uses: actions/checkout@v4
         with:
+          repository: kotoba-lang/ayatori
+          ref: d50ff2529daf428a5e3b8e43d1ca8ec0d6239c29
+          path: .deps/ayatori
+      - uses: actions/checkout@v4
+        with:
           repository: kotoba-lang/arrangement
-          # Same pin as kotobase-query's own deps.edn (transitive).
-          ref: 9e90426430bb4eb6206112a74465a4f9d62fe0c8
+          ref: 9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d
           path: .deps/arrangement
       - uses: actions/checkout@v4
         with:
           repository: kotoba-lang/prolly-tree
-          # Same pin as arrangement's own deps.edn (transitive).
-          ref: 2a5ba48a2eb11cc73b549ee75f5c1b71cc223566
+          ref: 644753aec57e12c9588786d46751b1503a5fd6f0
           path: .deps/prolly-tree
       - uses: actions/checkout@v4
         with:
           repository: kotoba-lang/io-ipld
-          # Same pin as arrangement's own deps.edn (transitive).
-          ref: e08dc3b2ab705be292e388cd1ad136381544a041
+          ref: f99bf27d58a75bb8cf6ddfd2d57a0aaac9c824ac
           path: .deps/io-ipld
       - uses: actions/checkout@v4
         with:
           repository: kotoba-lang/io-multiformats
-          # Same pin as io-ipld's own deps.edn (transitive).
-          ref: eec3ee85c458ea830be94518b9a42f4a8f1aee40
+          ref: 561fe7dfada3db852b127f06d41750dabd3cead9
           path: .deps/io-multiformats
       - uses: actions/checkout@v4
         with:
+          repository: kotoba-lang/org-nist-sha2
+          ref: e7c1b250adf3291ef99424fa85d8e7381cb086fb
+          path: .deps/org-nist-sha2
+      - uses: actions/checkout@v4
+        with:
           repository: kotoba-lang/org-ietf-cbor
-          # Same pin as io-ipld's own deps.edn (transitive).
-          ref: de18ad29102f9df150e214d756de4719c3c00d7a
+          ref: 1dacfc40c77573e3f4553093de0e0000f18a7c08
           path: .deps/org-ietf-cbor
+      - uses: actions/checkout@v4
+        with:
+          repository: kotoba-lang/dev-protobuf
+          ref: cfd0b29997abbcae918ec5e90fddd621dbfb97b6
+          path: .deps/dev-protobuf
+      - uses: actions/checkout@v4
+        with:
+          repository: kotoba-lang/datalog
+          ref: d18513af533917539c56435de6fb1426738da31a
+          path: .deps/datalog
+      - uses: actions/checkout@v4
+        with:
+          repository: kotoba-lang/io-ipni-specs
+          ref: 2c1559e2703bf41076188539c7086255b0d3c540
+          path: .deps/io-ipni-specs
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm install --global nbb
       - run: npm install
-      - run: nbb --classpath "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src" bin/run_tests.cljs
+      - run: nbb --classpath "src:test:.deps/kotobase/src:.deps/ayatori/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-nist-sha2/src:.deps/org-ietf-cbor/src:.deps/dev-protobuf/src:.deps/datalog/src:.deps/io-ipni-specs/src" bin/run_tests.cljs
+
+  jvm-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - run: clojure -M:test
+      - run: clojure -M:lint

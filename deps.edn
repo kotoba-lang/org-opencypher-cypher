@@ -17,10 +17,11 @@
  ;; bin/run_tests.cljs / CI clone every transitive dep by hand and list every
  ;; src dir on --classpath -- see the README's Develop/test section for the
  ;; exact command and kotobase-query's own README for why each hop is there.
- :deps {io.github.kotoba-lang/kotobase-query
-        {:git/sha "be8ba52b5e6581bb0489f35480ebea925c9fb478"}}
+ :deps {io.github.kotoba-lang/ayatori
+        {:git/url "https://github.com/kotoba-lang/ayatori.git"
+         :git/sha "d50ff2529daf428a5e3b8e43d1ca8ec0d6239c29"}}
  ;; First-class runtime is nbb/cljs (repo-wide runtime priority):
- ;;   nbb --classpath "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src" bin/run_tests.cljs
+ ;;   nbb --classpath "src:test:.deps/kotobase/src:.deps/ayatori/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-nist-sha2/src:.deps/org-ietf-cbor/src:.deps/dev-protobuf/src:.deps/datalog/src:.deps/io-ipni-specs/src" bin/run_tests.cljs
  ;; The :test alias below is the :clj COMPAT suite only -- not the primary
  ;; execution path.
  :aliases
