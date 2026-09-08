@@ -134,7 +134,7 @@
   only -- no `<-`, no undirected `--`) translates to a real
   `kotobase.query.bridge` cross-collection join: it requires `a`'s
   materialized document to carry an attribute named
-  `(keyword (clojure.string/lower-case \"REL_TYPE\"))` (i.e. the
+  `(keyword (str/lower \"REL_TYPE\"))` (i.e. the
   relationship type, case-folded to lower, underscores UNCHANGED -- e.g.
   `WORKS_AT` -> `:works_at`) whose value equals `b`'s `:kotobase/key`
   (materialized as a STRING, per `kotobase.query.bridge`'s own doc->datoms
@@ -169,7 +169,7 @@
   raw statement text, which is the caller's own Cypher, and a row count) --
   avoids leaking materialized property values or parameter payloads into
   the audit trail."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotobase.protocols.cypher.http :as http]
             [kotobase.protocols.cypher.json :as json]
             [kotobase.query.bridge :as bridge]
@@ -308,7 +308,7 @@
             (re-matches #"[A-Za-z_]" c)
             (let [m (re-find #"^[A-Za-z_][A-Za-z0-9_]*" (subs s i))]
               (recur (+ i (count m))
-                     (conj toks (if-let [kwtype (get keyword-tokens (str/upper-case m))]
+                     (conj toks (if-let [kwtype (get keyword-tokens (str/upper m))]
                                   {:type kwtype}
                                   {:type :ident :val m}))))
             :else
@@ -345,8 +345,8 @@
   (cond
     (= :match (peek-type toks)) (rest toks)
     (and (= :ident (peek-type toks))
-         (contains? unsupported-clause-keywords (str/upper-case (:val (first toks)))))
-    (throw (syntax-err (str (str/upper-case (:val (first toks)))
+         (contains? unsupported-clause-keywords (str/upper (:val (first toks)))))
+    (throw (syntax-err (str (str/upper (:val (first toks)))
                             " is not supported -- org-opencypher-cypher v0.1 is a"
                             " READ-ONLY query surface (MATCH/WHERE/RETURN only;"
                             " ADR-2607172300)")))
@@ -451,8 +451,8 @@
         [{:var v :prop prop :kind :cmp :null? (not negated?)} (rest toks)])
 
       (and (= :ident op-type)
-           (contains? string-fns (str/upper-case (str (:val (first toks))))))
-      (let [f (get string-fns (str/upper-case (str (:val (first toks)))))
+           (contains? string-fns (str/upper (str (:val (first toks))))))
+      (let [f (get string-fns (str/upper (str (:val (first toks)))))
             [val toks] (parse-value (rest toks))]
         [{:var v :prop prop :op f :value val} toks])
 
@@ -521,7 +521,7 @@
   the part that generalises."
   [toks]
   (let [agg? (and (= :ident (peek-type toks))
-                  (= "COUNT" (str/upper-case (str (:val (first toks)))))
+                  (= "COUNT" (str/upper (str (:val (first toks)))))
                   (= :lparen (:type (second toks))))
         [item toks]
         (if agg?
@@ -543,7 +543,7 @@
 (defn- parse-return [toks]
   (let [toks (expect toks :return)
         distinct? (and (= :ident (peek-type toks))
-                       (= "DISTINCT" (str/upper-case (str (:val (first toks))))))
+                       (= "DISTINCT" (str/upper (str (:val (first toks))))))
         toks (if distinct? (rest toks) toks)]
     (when-not (= :ident (peek-type toks))
       (throw (syntax-err "RETURN must project at least one property (var.prop)")))
@@ -564,7 +564,7 @@
   "True when the next token is the identifier `word`, case-insensitively."
   [toks word]
   (and (= :ident (peek-type toks))
-       (= word (str/upper-case (str (:val (first toks)))))))
+       (= word (str/upper (str (:val (first toks)))))))
 
 (defn- parse-order-by
   "`ORDER BY item [ASC|DESC] [, ...]` -> `[[{:var :prop :desc?} ...] toks]`."
@@ -723,7 +723,7 @@
   "Relationship-type -> foreign-key attribute convention for the
   (bonus, non-required) relationship-pattern join -- see ns docstring."
   [rel-type]
-  (keyword (str/lower-case rel-type)))
+  (keyword (str/lower rel-type)))
 
 (defn- resolve-value [v parameters]
   (if (and (map? v) (contains? v :cypher/param))
