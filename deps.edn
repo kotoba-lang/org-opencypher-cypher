@@ -17,7 +17,12 @@
  ;; bin/run_tests.cljs / CI clone every transitive dep by hand and list every
  ;; src dir on --classpath -- see the README's Develop/test section for the
  ;; exact command and kotobase-query's own README for why each hop is there.
- :deps {io.github.kotoba-lang/ayatori
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       io.github.kotoba-lang/ayatori
         {:git/url "https://github.com/kotoba-lang/ayatori.git"
          :git/sha "d50ff2529daf428a5e3b8e43d1ca8ec0d6239c29"}}
  ;; First-class runtime is nbb/cljs (repo-wide runtime priority):

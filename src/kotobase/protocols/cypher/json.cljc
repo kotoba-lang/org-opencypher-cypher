@@ -12,7 +12,7 @@
   and the :clj compat suite without reader-conditional JSON libraries.
   Parse returns maps with STRING keys (never keywordized — record fields
   are data, not code)."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; ---------------------------------------------------------------- encode
 

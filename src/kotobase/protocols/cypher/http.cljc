@@ -31,7 +31,7 @@
   injected kotobase.store/IStore under :store (LocalStore standalone,
   KotobaseStore against kotobase.net — the store seam never leaks into
   handler logic)."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn segments
   "Path → vector of decoded, non-empty segments: \"/a//b\" → [\"a\" \"b\"]."
@@ -42,7 +42,7 @@
 
 (defn query-param [req k] (get (:query req) k))
 
-(defn header [req k] (get (:headers req) (str/lower-case k)))
+(defn header [req k] (get (:headers req) (str/lower k)))
 
 (defn response
   ([status headers body] {:status status :headers headers :body body})
