@@ -14,7 +14,7 @@
  ;; pull in io-multiformats/org-ietf-cbor. tools.deps resolves that whole
  ;; chain transitively from the single direct dep below for the JVM :test
  ;; alias. The nbb primary test path has no dependency resolver, so
- ;; bin/run_tests.cljs / CI clone every transitive dep by hand and list every
+ ;; bin/run_tests.cljk / CI clone every transitive dep by hand and list every
  ;; src dir on --classpath -- see the README's Develop/test section for the
  ;; exact command and kotobase-query's own README for why each hop is there.
  :deps {
@@ -26,7 +26,7 @@
         {:git/url "https://github.com/kotoba-lang/ayatori.git"
          :git/sha "d50ff2529daf428a5e3b8e43d1ca8ec0d6239c29"}}
  ;; First-class runtime is nbb/cljs (repo-wide runtime priority):
- ;;   nbb --classpath "src:test:.deps/kotobase/src:.deps/ayatori/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-nist-sha2/src:.deps/org-ietf-cbor/src:.deps/dev-protobuf/src:.deps/datalog/src:.deps/io-ipni-specs/src" bin/run_tests.cljs
+ ;;   nbb --classpath "src:test:.deps/kotobase/src:.deps/ayatori/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-nist-sha2/src:.deps/org-ietf-cbor/src:.deps/dev-protobuf/src:.deps/datalog/src:.deps/io-ipni-specs/src" bin/run_tests.cljk
  ;; The :test alias below is the :clj COMPAT suite only -- not the primary
  ;; execution path.
  :aliases

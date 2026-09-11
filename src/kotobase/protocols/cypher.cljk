@@ -143,7 +143,7 @@
   attribute name derived mechanically from the relationship type instead
   of chosen ad hoc. This is this repo's own documented convention (there is
   no such thing as a stored 'relationship' or 'edge' in kotobase's flat
-  document model) -- see `test/kotobase/protocols/cypher_test.cljc` for a
+  document model) -- see `test/kotobase/protocols/cypher_test.cljk` for a
   worked fixture.
 
   ## `visible?` -- required, injectable, never defaulted

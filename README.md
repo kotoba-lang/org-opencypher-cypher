@@ -153,7 +153,7 @@ relationship type, case-folded to lower, underscores **unchanged** (e.g.
 `kotobase-query`'s own README worked example uses (`:dept-key` joining a
 department's `:kotobase/key`), just with the attribute name derived
 mechanically from the Cypher relationship type. See
-`test/kotobase/protocols/cypher_test.cljc`'s
+`test/kotobase/protocols/cypher_test.cljk`'s
 `end-to-end-relationship-join` for a worked fixture (`(u:users)-[:WORKS_AT]->(d:departments)`
 against users carrying a `:works_at` attribute).
 
@@ -250,7 +250,7 @@ git clone https://github.com/kotoba-lang/io-ipld .deps/io-ipld
 git clone https://github.com/kotoba-lang/io-multiformats .deps/io-multiformats
 git clone https://github.com/kotoba-lang/org-ietf-cbor .deps/org-ietf-cbor
 npm install
-nbb --classpath "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src" bin/run_tests.cljs
+nbb --classpath "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src" bin/run_tests.cljk
 ```
 
 Each `.deps/<name>` should be checked out at the SHA pinned in `deps.edn`
