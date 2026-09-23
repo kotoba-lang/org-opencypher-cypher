@@ -1,5 +1,5 @@
 (ns kotobase.protocols.cypher-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotobase.local :as local]
             [kotobase.protocols.cypher :as cypher]
             [kotobase.protocols.cypher.json :as json]
